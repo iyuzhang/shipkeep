@@ -46,6 +46,8 @@ function world(
     trigger?: DeploymentRecord['trigger'];
     /** The configuration of the release, when the default one does not fit the case. */
     config?: ShipkeepConfig;
+    /** What happens while this placement waits for another one to finish. */
+    whileWaitingForTheLock?: () => void;
     /** Replicas of the release that serves when the deployment starts. */
     serving?: StoredAllocation[];
     /** Replicas of other applications, counted in the load of their node. */
@@ -85,6 +87,8 @@ function world(
     { nodeId: string; kind: string | undefined; origin: ActionOrigin }
   >();
   const outcomes = new Map<string, StepOutcome>();
+  /** Store calls that matter for the order of a placement. */
+  const calls: string[] = [];
   const events: DomainEvent[] = [];
   const nodes = options.nodes ?? [
     {
@@ -143,10 +147,19 @@ function world(
       release = { ...release, imageDigest: digest };
       return Promise.resolve(true);
     },
-    nodes: () => Promise.resolve(nodes),
+    lockPlacement: (organizationId) => {
+      calls.push(`lock:${organizationId}`);
+      options.whileWaitingForTheLock?.();
+      return Promise.resolve();
+    },
+    nodes: () => {
+      calls.push('nodes');
+      return Promise.resolve(nodes);
+    },
     // Like the store: every placed replica of the organization, from one read.
-    load: (_org, replacing) =>
-      Promise.resolve(
+    load: (_org, replacing) => {
+      calls.push('load');
+      return Promise.resolve(
         nodeLoads(
           [
             ...allocations.filter((a) => !a.stopped).map((a) => ({ ...a, applicationId: APP })),
@@ -158,7 +171,8 @@ function world(
           ],
           replacing,
         ),
-      ),
+      );
+    },
   };
   const secretStore = {
     values: (_target: unknown, names: readonly string[]) =>
@@ -210,6 +224,7 @@ function world(
   };
   return {
     subject,
+    calls,
     pipelineStore: pipeline,
     events,
     superseded,
@@ -367,6 +382,41 @@ describe('DeploymentPipeline', () => {
       });
       expect(w.allocations).toEqual([]);
     });
+  });
+
+  it('takes the placement lock of the organization before it reads nodes and load', async () => {
+    const w = world();
+    await w.subject.run(ORG, w.deployment.id, () => NOW);
+    expect(w.allocations).toHaveLength(1);
+    // Read first and lock second would let two deployments count the same room (#315).
+    expect(w.calls).toEqual([`lock:${ORG}`, 'nodes', 'load']);
+  });
+
+  it('judges node liveness at the time it holds the lock, not at the time it asked for it', async () => {
+    // The node answered 5 seconds before the run started. While the placement waits for the
+    // lock, 30 more seconds pass without a heartbeat: the node is no longer ready.
+    let now = NOW;
+    const w = world({
+      nodes: [
+        {
+          id: NODE,
+          name: 'edge-1',
+          status: 'ready',
+          lastHeartbeatAt: new Date(NOW.getTime() - 5_000),
+          labels: {},
+          facts: READY_FACTS,
+        },
+      ],
+      whileWaitingForTheLock: () => {
+        now = new Date(NOW.getTime() + 30_000);
+      },
+    });
+    expect(await w.subject.run(ORG, w.deployment.id, () => now)).toBe('done');
+    expect(w.deployment).toMatchObject({
+      state: 'failed',
+      error: 'No node can run replica 1 of 1 (edge-1: not_ready).',
+    });
+    expect(w.allocations).toEqual([]);
   });
 
   describe('a release that cannot be planned (#314)', () => {
