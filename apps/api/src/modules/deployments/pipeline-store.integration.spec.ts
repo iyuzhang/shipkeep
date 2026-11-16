@@ -1,33 +1,12 @@
 import { create } from '@bufbuild/protobuf';
-import * as x509 from '@peculiar/x509';
 import { EnsureNetworkSchema } from '@shipkeep/proto-ts';
 
 import { PrismaUnitOfWork } from '../../platform/prisma/prisma-unit-of-work';
+import { enrollTestNode } from '../../testing/enroll-test-node';
 import { tenantHttpFixture } from '../../testing/tenant-http';
 import { AgentActions } from '../fleet/application/agent-actions';
-import { EnrollNode } from '../fleet/application/enroll-node';
-import { IssueJoinToken } from '../fleet/application/issue-join-token';
-import {
-  generateEd25519KeyPair,
-  importPrivateKey,
-  importPublicKey,
-  SIGNING_ALGORITHM,
-} from '../fleet/infrastructure/ca/x509';
 
 import { PIPELINE_STORE, type PipelineStore } from './application/ports';
-
-async function agentCsr(): Promise<string> {
-  const pair = await generateEd25519KeyPair();
-  const csr = await x509.Pkcs10CertificateRequestGenerator.create({
-    name: 'CN=agent',
-    keys: {
-      publicKey: await importPublicKey(pair.publicKeyPem),
-      privateKey: await importPrivateKey(pair.privateKeyPem),
-    },
-    signingAlgorithm: SIGNING_ALGORITHM,
-  });
-  return csr.toString('pem');
-}
 
 /** PLAN M3.4c4a: allocations, digests and step outcomes in the tenant context. */
 describe('pipeline store', () => {
@@ -45,18 +24,10 @@ describe('pipeline store', () => {
 
   beforeAll(async () => {
     fixture = await tenantHttpFixture();
-    const token = await fixture.app.get(IssueJoinToken).execute({
-      organizationId: fixture.organizationId,
-      actor: { kind: 'user', id: fixture.actors.owner.id },
+    nodeId = await enrollTestNode(fixture, {
+      facts: { hostname: 'edge-pipeline.example.com', architecture: 'amd64', cpu_count: 2 },
+      ready: false,
     });
-    nodeId = (
-      await fixture.app.get(EnrollNode).execute({
-        joinToken: token.value,
-        csrPem: await agentCsr(),
-        facts: { hostname: 'edge-pipeline.example.com', architecture: 'amd64', cpu_count: 2 },
-        agentVersion: '0.1.0',
-      })
-    ).nodeId;
     const application = await fixture
       .post(`${fixture.environment}/applications`, 'owner', {
         config: {

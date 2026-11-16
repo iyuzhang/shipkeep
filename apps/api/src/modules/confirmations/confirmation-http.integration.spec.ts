@@ -1,33 +1,12 @@
-import * as x509 from '@peculiar/x509';
 import { Secret } from '@shipkeep/domain';
 
 import { PrismaUnitOfWork } from '../../platform/prisma/prisma-unit-of-work';
 import { auditLog } from '../../testing/audit-log';
+import { enrollTestNode } from '../../testing/enroll-test-node';
 import { tenantHttpFixture } from '../../testing/tenant-http';
-import { EnrollNode } from '../fleet/application/enroll-node';
-import { IssueJoinToken } from '../fleet/application/issue-join-token';
-import {
-  generateEd25519KeyPair,
-  importPrivateKey,
-  importPublicKey,
-  SIGNING_ALGORITHM,
-} from '../fleet/infrastructure/ca/x509';
 
 import { ConfirmationVerifier } from './application/confirmation-verifier';
 import { parseConfirmationToken } from './domain/confirmation-token';
-
-async function agentCsr(): Promise<string> {
-  const pair = await generateEd25519KeyPair();
-  const csr = await x509.Pkcs10CertificateRequestGenerator.create({
-    name: 'CN=agent',
-    keys: {
-      publicKey: await importPublicKey(pair.publicKeyPem),
-      privateKey: await importPrivateKey(pair.privateKeyPem),
-    },
-    signingAlgorithm: SIGNING_ALGORITHM,
-  });
-  return csr.toString('pem');
-}
 
 /** PLAN M2.5a2: confirmation issuance over HTTP for `node.remove`. */
 describe('confirmations over HTTP', () => {
@@ -37,18 +16,10 @@ describe('confirmations over HTTP', () => {
 
   beforeAll(async () => {
     fixture = await tenantHttpFixture();
-    const token = await fixture.app.get(IssueJoinToken).execute({
-      organizationId: fixture.organizationId,
-      actor: { kind: 'user', id: fixture.actors.owner.id },
+    nodeId = await enrollTestNode(fixture, {
+      facts: { hostname: 'edge-confirm.example.com' },
+      ready: false,
     });
-    nodeId = (
-      await fixture.app.get(EnrollNode).execute({
-        joinToken: token.value,
-        csrPem: await agentCsr(),
-        facts: { hostname: 'edge-confirm.example.com' },
-        agentVersion: '0.1.0',
-      })
-    ).nodeId;
   });
   afterAll(async () => {
     await fixture.close();

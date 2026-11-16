@@ -1,5 +1,4 @@
 import { create } from '@bufbuild/protobuf';
-import * as x509 from '@peculiar/x509';
 import {
   type ActionRequest,
   ActionRequestSchema,
@@ -8,17 +7,9 @@ import {
 } from '@shipkeep/proto-ts';
 import { Client } from 'pg';
 
+import { enrollTestNode } from '../../testing/enroll-test-node';
 import { tenantHttpFixture } from '../../testing/tenant-http';
 import { AgentActions } from '../fleet/application/agent-actions';
-import { EnrollNode } from '../fleet/application/enroll-node';
-import { IssueJoinToken } from '../fleet/application/issue-join-token';
-import { NodeLiveness } from '../fleet/application/node-liveness';
-import {
-  generateEd25519KeyPair,
-  importPrivateKey,
-  importPublicKey,
-  SIGNING_ALGORITHM,
-} from '../fleet/infrastructure/ca/x509';
 import { ResourceCommands } from '../organizations/application/resource-commands';
 
 import { DeploymentPipeline } from './application/deployment-pipeline';
@@ -48,19 +39,6 @@ interface Page {
   nextCursor: string | null;
 }
 
-async function agentCsr(): Promise<string> {
-  const pair = await generateEd25519KeyPair();
-  const csr = await x509.Pkcs10CertificateRequestGenerator.create({
-    name: 'CN=agent',
-    keys: {
-      publicKey: await importPublicKey(pair.publicKeyPem),
-      privateKey: await importPrivateKey(pair.privateKeyPem),
-    },
-    signingAlgorithm: SIGNING_ALGORITHM,
-  });
-  return csr.toString('pem');
-}
-
 function action(init: unknown): ActionRequest['action'] {
   return create(ActionRequestSchema, { action: init as ActionRequest['action'] }).action;
 }
@@ -75,22 +53,11 @@ describe('agent actions of an application over HTTP', () => {
   let deploymentId: string;
   let foreign: { nodeId: string; applicationId: string; deploymentId: string; path: string };
 
-  const enrol = async (organizationId: string, hostname: string) => {
-    const token = await fixture.app.get(IssueJoinToken).execute({
-      organizationId,
-      actor: { kind: 'user', id: fixture.actors.owner.id },
-    });
-    const id = (
-      await fixture.app.get(EnrollNode).execute({
-        joinToken: token.value,
-        csrPem: await agentCsr(),
-        facts: { hostname, architecture: 'amd64', cpu_count: 2, memory_bytes: 2 ** 32 },
-        agentVersion: '0.1.0',
-      })
-    ).nodeId;
-    await fixture.app.get(NodeLiveness).heartbeat({ organizationId, nodeId: id, serial: '' });
-    return id;
-  };
+  const enrol = (organizationId: string, hostname: string) =>
+    enrollTestNode(
+      { ...fixture, organizationId },
+      { facts: { hostname, architecture: 'amd64', cpu_count: 2, memory_bytes: 2 ** 32 } },
+    );
   const deploy = async (environment: string, name: string) => {
     const created = await fixture
       .post(`${environment}/applications`, 'owner', {
