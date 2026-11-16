@@ -3,7 +3,7 @@ import type { PlacementRequest, SchedulableNode } from '@shipkeep/domain';
 
 import { observedStatus } from '../../fleet/domain/node';
 
-import { cpuMillis, sizeBytes } from './container-plan';
+import { resourceLimits } from './container-plan';
 
 /** What placement needs from a node record. */
 export interface NodeView {
@@ -67,15 +67,62 @@ export function schedulableNodes(
     });
 }
 
-/** The placement request of an image application's replicas (SPEC 2 `scale`, `resources`). */
+/** A placed, unstopped replica, as the load of its node needs it. */
+export interface PlacedReplica {
+  readonly nodeId: string;
+  readonly applicationId: string;
+  readonly releaseId: string;
+  readonly cpuMillis: number;
+  readonly memoryBytes: number;
+}
+
+/** The release a deployment places: the application's replicas of other releases are replaced. */
+export interface ReplacingRelease {
+  readonly applicationId: string;
+  readonly releaseId: string;
+}
+
+/**
+ * Sums placed replicas into the load of each node (SPEC 6). The replicas that the deployment of
+ * `replacing` replaces reserve nothing: they stop when it succeeds, and its own replicas are
+ * removed when it fails, so only one of the two releases keeps its reservation. Counting both
+ * would refuse every new release of an application on a node that the application fills. They
+ * still count in `applications`, which only ranks nodes for spread.
+ *
+ * `replicas` must come from one read: taking the replaced replicas from an earlier read could
+ * free the room of replicas that were stopped in between, and so free it twice.
+ */
+export function nodeLoads(
+  replicas: readonly PlacedReplica[],
+  replacing?: ReplacingRelease,
+): Map<string, NodeLoad> {
+  const loads = new Map<string, NodeLoad>();
+  for (const replica of replicas) {
+    const current = loads.get(replica.nodeId) ?? { cpuMillis: 0, memoryBytes: 0, applications: [] };
+    const replaced =
+      replacing !== undefined &&
+      replica.applicationId === replacing.applicationId &&
+      replica.releaseId !== replacing.releaseId;
+    loads.set(replica.nodeId, {
+      cpuMillis: current.cpuMillis + (replaced ? 0 : replica.cpuMillis),
+      memoryBytes: current.memoryBytes + (replaced ? 0 : replica.memoryBytes),
+      applications: current.applications.includes(replica.applicationId)
+        ? current.applications
+        : [...current.applications, replica.applicationId],
+    });
+  }
+  return loads;
+}
+
+/**
+ * The placement request of an image application's replicas (SPEC 2 `scale`, `resources`). It
+ * reserves the limits the containers run under, defaults included.
+ */
 export function placementRequest(applicationId: string, config: ShipkeepConfig): PlacementRequest {
   return {
     app: applicationId,
     architectures: ARCHITECTURES,
-    resources: {
-      cpuMillis: cpuMillis(config.resources?.cpu),
-      memoryBytes: sizeBytes(config.resources?.memory),
-    },
+    resources: resourceLimits(config),
     labels: Object.fromEntries(
       Object.entries(config.scale?.placement?.labels ?? {}).filter(
         (entry): entry is [string, string] => typeof entry[1] === 'string',

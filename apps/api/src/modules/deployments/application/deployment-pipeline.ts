@@ -14,7 +14,7 @@ import {
 
 import { DomainEventBus } from '../../../platform/events/domain-event-bus';
 import { SECRET_STORE, type SecretStore } from '../../secrets/application/ports';
-import { containerName, cpuMillis, sizeBytes } from '../domain/container-plan';
+import { containerName } from '../domain/container-plan';
 import { parseImageReference, pinnedReference } from '../domain/image-reference';
 import {
   type PipelineContext,
@@ -190,9 +190,13 @@ export class DeploymentPipeline {
     const config = context.release.config;
     return this.tenant(application, async () => {
       const nodes = await this.pipeline.nodes(application.organizationId);
+      // The replicas this deployment replaces give their room to the new release (SPEC 6).
       const scheduler = schedulableNodes(
         nodes,
-        await this.pipeline.load(application.organizationId),
+        await this.pipeline.load(application.organizationId, {
+          applicationId: application.id,
+          releaseId: context.release.id,
+        }),
         now,
       );
       const request = placementRequest(application.id, config);
@@ -216,8 +220,8 @@ export class DeploymentPipeline {
         nodeId: ids.get(name) ?? '',
         container: containerName(application, context.release.number, index),
         port: config.run?.port ?? 0,
-        cpuMillis: cpuMillis(config.resources?.cpu),
-        memoryBytes: sizeBytes(config.resources?.memory),
+        // What placement reserved, which is also what the container plan enforces.
+        ...request.resources,
       }));
       if (
         await this.pipeline.place(
