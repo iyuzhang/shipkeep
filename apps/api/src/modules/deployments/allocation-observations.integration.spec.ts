@@ -1,35 +1,14 @@
 import { create } from '@bufbuild/protobuf';
-import * as x509 from '@peculiar/x509';
 import { ContainerStatus_State, StateReportSchema } from '@shipkeep/proto-ts';
 import { Client } from 'pg';
 
 import { PrismaUnitOfWork } from '../../platform/prisma/prisma-unit-of-work';
 import { auditLog } from '../../testing/audit-log';
+import { enrollTestNode } from '../../testing/enroll-test-node';
 import { tenantHttpFixture } from '../../testing/tenant-http';
-import { EnrollNode } from '../fleet/application/enroll-node';
-import { IssueJoinToken } from '../fleet/application/issue-join-token';
-import {
-  generateEd25519KeyPair,
-  importPrivateKey,
-  importPublicKey,
-  SIGNING_ALGORITHM,
-} from '../fleet/infrastructure/ca/x509';
 
 import { AllocationObservations } from './application/allocation-observations';
 import { PIPELINE_STORE, type PipelineStore } from './application/ports';
-
-async function agentCsr(): Promise<string> {
-  const pair = await generateEd25519KeyPair();
-  const csr = await x509.Pkcs10CertificateRequestGenerator.create({
-    name: 'CN=agent',
-    keys: {
-      publicKey: await importPublicKey(pair.publicKeyPem),
-      privateKey: await importPrivateKey(pair.privateKeyPem),
-    },
-    signingAlgorithm: SIGNING_ALGORITHM,
-  });
-  return csr.toString('pem');
-}
 
 const CONTAINER = 'sk-observed-api-0123456789ab-r1-0';
 const report = (state: ContainerStatus_State) =>
@@ -40,20 +19,8 @@ const report = (state: ContainerStatus_State) =>
 /** PLAN M1.6b2: observations stay apart from reservations and bound to the reporting node. */
 describe('allocation observations with PostgreSQL', () => {
   let fixture: Awaited<ReturnType<typeof tenantHttpFixture>>;
-  const enroll = async (hostname: string) => {
-    const token = await fixture.app.get(IssueJoinToken).execute({
-      organizationId: fixture.organizationId,
-      actor: { kind: 'user', id: fixture.actors.owner.id },
-    });
-    return (
-      await fixture.app.get(EnrollNode).execute({
-        joinToken: token.value,
-        csrPem: await agentCsr(),
-        facts: { hostname },
-        agentVersion: '0.1.0',
-      })
-    ).nodeId;
-  };
+  const enroll = (hostname: string) =>
+    enrollTestNode(fixture, { facts: { hostname }, ready: false });
 
   beforeAll(async () => {
     fixture = await tenantHttpFixture();
