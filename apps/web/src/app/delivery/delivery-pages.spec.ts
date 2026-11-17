@@ -1,5 +1,10 @@
 import { TestBed } from '@angular/core/testing';
-import { provideRouter, withComponentInputBinding, withRouterConfig } from '@angular/router';
+import {
+  provideRouter,
+  Router,
+  withComponentInputBinding,
+  withRouterConfig,
+} from '@angular/router';
 import { RouterTestingHarness } from '@angular/router/testing';
 
 import { appRoutes } from '../app.routes';
@@ -308,6 +313,199 @@ describe('delivery screens', () => {
     expect(element().querySelector('[role="status"]')?.textContent).toContain('queued');
     expect(deploymentsText()).toContain('rollback');
     expect((rollbacks()[0] as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  describe('danger zone (#256)', () => {
+    const replica = {
+      id: 'a-1',
+      releaseId: 'r-new',
+      replica: 0,
+      nodeId: 'n-1',
+      nodeName: 'edge-1',
+      container: 'sk-billing-api-0000000000dd-r1-0',
+      state: 'running',
+      observedAt: '2026-11-06T09:00:00Z',
+    };
+    const danger = `/orgs/${ORG}/projects/${PROJECT}/environments/${ENV}/applications/${APP}?section=danger`;
+    const button = (label: string) =>
+      Array.from(element().querySelectorAll('#panel-config button')).find(
+        (b) => b.textContent.trim() === label,
+      ) as HTMLButtonElement | undefined;
+    const posts = () => requests.filter((r) => r.method === 'POST').map((r) => r.path);
+
+    it('stops a running application after asking once more, and never offers to delete it', async () => {
+      const live = { ...deployment('succeeded'), id: 'd-new', releaseId: 'r-new', stop: false };
+      let deployments: unknown[] = [live];
+      let replicas: unknown[] = [replica];
+      routes = {
+        [`GET ${BASE}/applications/${APP}`]: () => json(application),
+        [`GET ${BASE}/applications/${APP}/deployments`]: () => json({ items: deployments }),
+        [`GET ${BASE}/applications/${APP}/replicas`]: () => json({ items: replicas }),
+        [`POST ${BASE}/applications/${APP}/stop`]: () => {
+          const stopping = {
+            ...deployment('queued'),
+            id: 'd-stop',
+            releaseId: 'r-new',
+            stop: true,
+          };
+          deployments = [stopping, live];
+          return json(stopping, 201);
+        },
+      };
+      await harness.navigateByUrl(danger);
+      await settle();
+      // No sample row is left: only what the control plane can do.
+      expect(configText()).not.toContain('maintenance');
+      expect(configText()).toContain('Stop it first');
+      expect(button('Delete')?.disabled).toBe(true);
+      expect(button('Stop')?.disabled).toBe(false);
+
+      await click('Stop');
+      // Nothing is sent before the second click.
+      expect(posts()).toEqual([]);
+      await click('Keep it running');
+      expect(button('Stop')).toBeDefined();
+      await click('Stop');
+      await click('Stop it now');
+      expect(posts()).toEqual([`${BASE}/applications/${APP}/stop`]);
+      // The page follows the stop like any deployment, and says what it is.
+      expect(element().querySelector('[role="status"]')?.textContent).toContain('stopping');
+      expect(button('Stop')?.disabled).toBe(true);
+
+      deployments = [
+        { ...deployment('succeeded'), id: 'd-stop', releaseId: 'r-new', stop: true },
+        live,
+      ];
+      replicas = [];
+      // The agents finished: the page learns it from the live events, as for any deployment.
+      sources[0]?.emit({ applicationId: APP });
+      await settle();
+      expect(element().querySelector('.page-head .pill')?.textContent).toContain('stopped');
+      expect(configText()).toContain('It has no running replica.');
+      expect(button('Stop')?.disabled).toBe(true);
+      expect(button('Delete')?.disabled).toBe(false);
+      // The version that ran before the stop can be started again; the stop itself cannot.
+      expect(
+        Array.from(element().querySelectorAll('#panel-deployments button')).filter((b) =>
+          b.textContent.includes('Roll back'),
+        ),
+      ).toHaveLength(1);
+      expect(deploymentsText()).toContain('stop');
+      // The deployment card shows the stop as a stop, with its own two steps.
+      const card = element().querySelector('#panel-deployments .card')?.textContent ?? '';
+      expect(card).toContain('Stop of r-new');
+      expect(card).toContain('stop requested');
+      expect(card).toContain('Routes and replicas removed');
+      expect(card).not.toContain('Health check');
+      expect(card).not.toContain('live');
+    });
+
+    it('deletes a stopped application once its exact name is typed, then leaves the page', async () => {
+      routes = {
+        [`GET ${BASE}/applications/${APP}`]: () => json(application),
+        [`GET ${BASE}/applications/${APP}/deployments`]: () => json({ items: [] }),
+        [`GET ${BASE}/applications/${APP}/replicas`]: () => json({ items: [] }),
+        [`POST /api/v1/organizations/${ORG}/confirmations`]: () =>
+          json(
+            { id: 'c-1', token: 'signed.confirmation.token', expiresAt: '2026-11-06T09:05:00Z' },
+            201,
+          ),
+        [`POST ${BASE}/applications/${APP}/delete`]: () => new Response(null, { status: 204 }),
+        [`GET ${BASE}`]: () => json(environment),
+        [`GET ${BASE}/applications`]: () => json({ items: [] }),
+      };
+      await harness.navigateByUrl(danger);
+      await settle();
+      await click('Delete');
+      const confirm = () => button('Delete the application');
+      expect(confirm()?.disabled).toBe(true);
+      fill('confirm-name', 'billing');
+      harness.fixture.detectChanges();
+      expect(confirm()?.disabled).toBe(true);
+      expect(posts()).toEqual([]);
+      fill('confirm-name', 'billing-api');
+      harness.fixture.detectChanges();
+      expect(confirm()?.disabled).toBe(false);
+      await submit(0);
+
+      const sent = requests.filter((r) => r.method === 'POST');
+      expect(sent.map((r) => [r.path, r.body])).toEqual([
+        [
+          `/api/v1/organizations/${ORG}/confirmations`,
+          { action: 'application.delete', target: APP, name: 'billing-api' },
+        ],
+        [`${BASE}/applications/${APP}/delete`, { confirmation: 'signed.confirmation.token' }],
+      ]);
+      // Back to the environment the application was in.
+      expect(TestBed.inject(Router).url).toBe(
+        `/orgs/${ORG}/projects/${PROJECT}/environments/${ENV}`,
+      );
+    });
+
+    it('lists a stopped application as stopped, never as live', async () => {
+      routes = {
+        [`GET ${BASE}`]: () => json(environment),
+        [`GET ${BASE}/applications`]: () => json({ items: [application] }),
+        [`GET ${BASE}/applications/${APP}/deployments`]: () =>
+          json({
+            items: [
+              { ...deployment('succeeded'), id: 'd-stop', releaseId: 'r-new', stop: true },
+              { ...deployment('succeeded'), id: 'd-new', releaseId: 'r-new', stop: false },
+            ],
+          }),
+      };
+      await harness.navigateByUrl(`/orgs/${ORG}/projects/${PROJECT}/environments/${ENV}`);
+      await settle();
+      const row = Array.from(element().querySelectorAll('.grid-table')).find((r) =>
+        r.textContent.includes('billing-api'),
+      );
+      expect(row?.textContent).toContain('stopped');
+      expect(row?.textContent).not.toContain('live');
+    });
+
+    it('lets a stop be asked again after the server refused the first one', async () => {
+      const live = { ...deployment('succeeded'), id: 'd-new', releaseId: 'r-new', stop: false };
+      let refusals = 1;
+      routes = {
+        [`GET ${BASE}/applications/${APP}`]: () => json(application),
+        [`GET ${BASE}/applications/${APP}/deployments`]: () => json({ items: [live] }),
+        [`GET ${BASE}/applications/${APP}/replicas`]: () => json({ items: [replica] }),
+        [`POST ${BASE}/applications/${APP}/stop`]: () =>
+          refusals-- > 0
+            ? json({ code: 'deployment_in_progress', title: 'Conflict', status: 409 }, 409)
+            : json({ ...deployment('queued'), id: 'd-stop', releaseId: 'r-new', stop: true }, 201),
+      };
+      await harness.navigateByUrl(danger);
+      await settle();
+      await click('Stop');
+      await click('Stop it now');
+      expect(posts()).toHaveLength(1);
+      expect(element().querySelector('#panel-config [role="alert"]')).not.toBeNull();
+      // A refusal must not leave the button dead: asking again starts a new attempt.
+      await click('Stop');
+      expect(element().querySelector('#panel-config [role="alert"]')).toBeNull();
+      await click('Stop it now');
+      expect(posts()).toHaveLength(2);
+    });
+
+    it('keeps the application and says why when the server refuses the deletion', async () => {
+      routes = {
+        [`GET ${BASE}/applications/${APP}`]: () => json(application),
+        [`GET ${BASE}/applications/${APP}/deployments`]: () => json({ items: [] }),
+        [`GET ${BASE}/applications/${APP}/replicas`]: () => json({ items: [] }),
+        [`POST /api/v1/organizations/${ORG}/confirmations`]: () =>
+          json({ code: 'confirmation_name_mismatch', title: 'Bad Request', status: 400 }, 400),
+      };
+      await harness.navigateByUrl(danger);
+      await settle();
+      await click('Delete');
+      fill('confirm-name', 'billing-api');
+      await submit(0);
+      expect(posts()).toEqual([`/api/v1/organizations/${ORG}/confirmations`]);
+      expect(element().querySelector('[role="alert"]')).not.toBeNull();
+      expect(TestBed.inject(Router).url).toContain(`/applications/${APP}`);
+      expect(button('Delete')?.disabled).toBe(false);
+    });
   });
 
   it('shows where each domain points, and whether a server running the app answers', async () => {
@@ -715,5 +913,40 @@ describe('delivery screens', () => {
     await settle();
     expect(deploymentsText()).toContain('cancelled');
     expect(element().querySelector('[role="status"]')).toBeNull();
+  });
+
+  it('deploys again after the server refused for a missing secret', async () => {
+    // The first refusal is the common one: the configuration names a secret that is not set yet.
+    let refusals = 1;
+    let deployments: unknown[] = [];
+    routes = {
+      [`GET ${BASE}/applications/${APP}`]: () => json(application),
+      [`GET ${BASE}/applications/${APP}/deployments`]: () => json({ items: deployments }),
+      [`POST ${BASE}/applications/${APP}/deployments`]: () => {
+        if (refusals-- > 0)
+          return json({ code: 'secrets_missing', title: 'Conflict', status: 409 }, 409);
+        deployments = [deployment('queued')];
+        return json({ release: {}, deployment: deployments[0] }, 201);
+      },
+    };
+    await harness.navigateByUrl(
+      `/orgs/${ORG}/projects/${PROJECT}/environments/${ENV}/applications/${APP}`,
+    );
+    await settle();
+    const deploy = () =>
+      Array.from(element().querySelectorAll('button')).find((b) =>
+        b.textContent.includes('Deploy'),
+      );
+    const sent = () =>
+      requests.filter((r) => r.method === 'POST' && r.path.endsWith('/deployments')).length;
+    deploy()?.click();
+    await settle();
+    expect(sent()).toBe(1);
+    expect(element().querySelector('[role="alert"]')).not.toBeNull();
+    // Once the secret is set, the same button must work without reloading the page.
+    deploy()?.click();
+    await settle();
+    expect(sent()).toBe(2);
+    expect(element().querySelector('[role="status"]')?.textContent).toContain('queued');
   });
 });

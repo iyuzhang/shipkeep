@@ -9,7 +9,7 @@ import {
   signal,
 } from '@angular/core';
 import { toSignal } from '@angular/core/rxjs-interop';
-import { ActivatedRoute, RouterLink } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { map } from 'rxjs';
 
 import { BlockView } from '../dashboard/block-view';
@@ -44,6 +44,7 @@ import {
   type SectionCopy,
 } from './application-design';
 import { AgentActionsPanel } from './agent-actions-panel';
+import { ApplicationDanger } from './application-danger';
 import { configSection } from './config-sections';
 import { ConfigurationEditor } from './configuration-editor';
 import { LiveEvents } from './live-events';
@@ -67,9 +68,14 @@ const STEPS: readonly { label: string; states: readonly string[] }[] = [
   { label: 'Health check', states: ['health_checking'] },
   { label: 'Switchover', states: ['switching', 'draining'] },
 ];
+/** A stop goes from the queue straight to removing what runs (SPEC 5.1). */
+const STOP_STEPS: typeof STEPS = [
+  { label: 'Queued', states: ['queued'] },
+  { label: 'Routes and replicas removed', states: ['draining'] },
+];
 const SAMPLE_SECTIONS = new Set(['tasks', 'approvals', 'webhooks']);
 /** Sections with their own content instead of configuration blocks. */
-const OWN_SECTIONS = new Set(['yml', 'rollback', 'actions']);
+const OWN_SECTIONS = new Set(['yml', 'rollback', 'actions', 'danger']);
 
 const FINISHED = new Set(['succeeded', 'failed', 'cancelled', 'rolled_back']);
 /** While a deployment runs, its state is refreshed this often. */
@@ -82,6 +88,7 @@ const LIVE_POLL_MS = 15_000;
   selector: 'sk-application-page',
   imports: [
     AgentActionsPanel,
+    ApplicationDanger,
     BlockView,
     Brand,
     ConfigurationEditor,
@@ -251,6 +258,15 @@ const LIVE_POLL_MS = 15_000;
                 [revision]="reloads()"
                 [deploymentLabels]="deploymentLabels()"
               />
+            } @else if (section() === 'danger') {
+              <sk-application-danger
+                [environment]="environment()"
+                [application]="current"
+                [running]="replicas.items().length > 0"
+                [deploying]="!!active()"
+                (stopped)="refresh()"
+                (deleted)="leave()"
+              />
             } @else {
               @for (b of copy.blocks; track $index) {
                 <sk-block [block]="b" [organizationId]="organizationId()" />
@@ -267,12 +283,13 @@ const LIVE_POLL_MS = 15_000;
           class="flex flex-col gap-3.5"
         >
           @if (focus(); as d) {
-            @let st = status(d.state);
+            @let st = status(d.state, d.stop);
             <div class="card p-5">
               <div class="mb-[18px] flex flex-wrap items-center justify-between gap-2.5">
                 <div class="flex items-baseline gap-2.5">
                   <span class="text-[14px] font-medium">{{
-                    'Deployment {release}' | t: { release: d.releaseId.slice(0, 7) }
+                    (d.stop ? 'Stop of {release}' : 'Deployment {release}')
+                      | t: { release: d.releaseId.slice(0, 7) }
                   }}</span>
                   <span class="text-[12.5px]" [style.color]="st.color">{{ st.label | t }}</span>
                 </div>
@@ -303,7 +320,9 @@ const LIVE_POLL_MS = 15_000;
                 <div>
                   <span class="text-dim3">{{ clock(d.startedAt) }} </span
                   ><span class="text-fg3">{{
-                    '{trigger} deployment started' | t: { trigger: (d.trigger | t) }
+                    d.stop
+                      ? ('stop requested' | t)
+                      : ('{trigger} deployment started' | t: { trigger: (d.trigger | t) })
                   }}</span>
                 </div>
                 @if (d.build) {
@@ -340,7 +359,7 @@ const LIVE_POLL_MS = 15_000;
               {{ 'Deployments' | t }}
             </h2>
             @for (d of deployments.items(); track d.id) {
-              @let st = status(d.state);
+              @let st = status(d.state, d.stop);
               <div
                 class="grid grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)_minmax(0,0.9fr)_minmax(0,0.8fr)] items-center gap-3 border-t border-line2 px-5 py-[11px] text-[13px] max-sm:grid-cols-2"
               >
@@ -349,7 +368,9 @@ const LIVE_POLL_MS = 15_000;
                   <span class="font-mono text-[11.5px] text-fg2">{{
                     d.releaseId.slice(0, 7)
                   }}</span>
-                  <span class="text-fg3">{{ d.error ?? (d.trigger | t) }}</span>
+                  <span class="ml-2 text-fg3">{{
+                    d.error ?? ((d.stop ? 'stop' : d.trigger) | t)
+                  }}</span>
                 </div>
                 <span class="flex items-center gap-[7px] text-[12.5px]" [style.color]="st.color"
                   ><span class="dot" [style.background]="st.color"></span>{{ st.label | t }}</span
@@ -503,6 +524,7 @@ const LIVE_POLL_MS = 15_000;
 export class ApplicationPage {
   private readonly api = inject(DeliveryApi);
   private readonly liveEvents = inject(LiveEvents);
+  private readonly router = inject(Router);
   protected readonly runner = inject(MutationRunner);
   protected readonly shell = inject(ShellContext);
   protected readonly tab = signal('config');
@@ -588,6 +610,12 @@ export class ApplicationPage {
         desc: 'The closed list of typed actions agents ran for this app. No free-form shell commands.',
         blocks: [],
       };
+    if (key === 'danger')
+      return {
+        title: 'Danger zone',
+        desc: 'Stopping frees the servers and keeps everything else. Deleting cannot be undone.',
+        blocks: [],
+      };
     if (key in APP_SAMPLES) return APP_SAMPLES[key as keyof typeof APP_SAMPLES];
     const app = this.application();
     return (
@@ -614,7 +642,7 @@ export class ApplicationPage {
   );
   protected readonly headline = computed(() => {
     const latest = this.deployments.items().at(0);
-    return latest ? deploymentStatus(latest.state) : null;
+    return latest ? deploymentStatus(latest.state, latest.stop) : null;
   });
   /** The deployment the pipeline shows: the one asked for, the one running, or the latest. */
   protected readonly focus = computed(
@@ -628,8 +656,9 @@ export class ApplicationPage {
     const d = this.focus();
     if (!d) return [];
     const done = d.state === 'succeeded' || d.state === 'rolled_back';
-    const at = STEPS.findIndex((step) => step.states.includes(d.state));
-    return STEPS.map((step, i) => {
+    const steps = d.stop ? STOP_STEPS : STEPS;
+    const at = steps.findIndex((step) => step.states.includes(d.state));
+    return steps.map((step, i) => {
       const past = done || (at >= 0 && i < at);
       const now = !done && i === at;
       const color = now ? BLUE : '#D6D6DC';
@@ -779,7 +808,19 @@ export class ApplicationPage {
   }
 
   /** Reloads the deployments, and keeps doing so while one is still running. */
-  private async refresh(): Promise<void> {
+  /** The application was deleted: back to its environment, where it no longer is listed. */
+  protected leave(): void {
+    void this.router.navigate([
+      '/orgs',
+      this.organizationId(),
+      'projects',
+      this.projectId(),
+      'environments',
+      this.environmentId(),
+    ]);
+  }
+
+  protected async refresh(): Promise<void> {
     clearTimeout(this.timer);
     void this.replicas.refresh();
     await this.deployments.refresh();
@@ -798,6 +839,7 @@ export class ApplicationPage {
   }
 
   protected async deploy(): Promise<void> {
+    this.again();
     const outcome = await this.runner.run({ deploy: this.applicationId() }, () =>
       this.api.deploy(this.environment(), this.applicationId()),
     );
@@ -819,12 +861,25 @@ export class ApplicationPage {
 
   /** Versions that ran, other than the one serving now (the latest success). */
   protected canRollBack(deployment: Deployment): boolean {
+    // A stop ran no version of its own: the deployment it stopped is the one to go back to.
+    if (deployment.stop) return false;
     if (deployment.state !== 'succeeded' && deployment.state !== 'rolled_back') return false;
-    const serving = this.deployments.items().find((item) => item.state === 'succeeded');
-    return deployment.releaseId !== serving?.releaseId;
+    const latest = this.deployments.items().find((item) => item.state === 'succeeded');
+    // After a stop nothing serves, so every version that ran can be started again.
+    return latest?.stop === true || deployment.releaseId !== latest?.releaseId;
+  }
+
+  /**
+   * A click is a new attempt. The runner stays locked after a refusal (a 409, for a missing
+   * secret or a deployment already running), and would otherwise ignore every later click until
+   * the page is reloaded. A wait the server asked for is kept.
+   */
+  private again(): void {
+    if (this.runner.restartRequired()) this.runner.reset();
   }
 
   protected async rollback(deploymentId: string): Promise<void> {
+    this.again();
     const outcome = await this.runner.run({ rollback: deploymentId }, () =>
       this.api.rollback(this.environment(), this.applicationId(), deploymentId),
     );
@@ -832,6 +887,7 @@ export class ApplicationPage {
   }
 
   protected async cancel(deploymentId: string): Promise<void> {
+    this.again();
     const outcome = await this.runner.run({ cancel: deploymentId }, () =>
       this.api.cancel(this.environment(), this.applicationId(), deploymentId),
     );
