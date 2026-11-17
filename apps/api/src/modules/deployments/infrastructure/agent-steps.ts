@@ -1,5 +1,5 @@
 import { create } from '@bufbuild/protobuf';
-import { type Duration, DurationSchema } from '@bufbuild/protobuf/wkt';
+import { type Duration, DurationSchema, timestampFromDate } from '@bufbuild/protobuf/wkt';
 import { ConflictError, type Secret } from '@shipkeep/domain';
 import {
   type ActionRequest,
@@ -10,6 +10,8 @@ import {
   HealthCheckSchema,
   PortMapping_Protocol,
   PullImageSchema,
+  type RegistryCredentials,
+  RegistryCredentialsSchema,
   RemoveContainerSchema,
   RemoveRouteSchema,
   RestartPolicy_Mode,
@@ -20,7 +22,9 @@ import {
   UpsertRouteSchema,
 } from '@shipkeep/proto-ts';
 
+import { DOCKER_HUB_SERVER, type RegistryLogin } from '../../registries/domain/registry-credential';
 import type { ContainerPlan } from '../domain/container-plan';
+import { credentialServer, parseImageReference, pulledRegistry } from '../domain/image-reference';
 import type { PipelineStep } from '../domain/pipeline';
 
 /** Decrypted secret values of the environment, by name (SECRET_STORE.values). */
@@ -30,15 +34,40 @@ export type SecretValues = ReadonlyMap<
 >;
 
 /**
- * A planner step as the agent action it stands for (SPEC 3.3). Secret values are injected here,
- * at enqueue time, and only travel inside the encrypted action payload over mTLS (SPEC 9).
+ * What the organization stored for the registries of the images to pull (ADR 0019), by the name
+ * they are stored under, and when the credentials sent to an agent stop being valid.
  */
-export function agentAction(step: PipelineStep, secrets: SecretValues): ActionRequest['action'] {
+export interface RegistryAccess {
+  readonly logins: ReadonlyMap<string, RegistryLogin>;
+  readonly expiresAt: Date;
+  /**
+   * Nodes whose agent refuses `docker.io` credentials for a reference without a registry host
+   * (`acceptsDockerHubCredentials`): their Docker Hub pulls carry none.
+   */
+  readonly withoutDockerHub?: ReadonlySet<string>;
+}
+
+/**
+ * A planner step as the agent action it stands for (SPEC 3.3). Secret values and registry
+ * credentials are injected here, at enqueue time, and only travel inside the encrypted action
+ * payload over mTLS (SPEC 9).
+ */
+export function agentAction(
+  step: PipelineStep,
+  secrets: SecretValues,
+  registries?: RegistryAccess,
+): ActionRequest['action'] {
   switch (step.kind) {
     case 'ensure_network':
       return { case: 'ensureNetwork', value: create(EnsureNetworkSchema, { name: step.network }) };
     case 'pull_image':
-      return { case: 'pullImage', value: create(PullImageSchema, { imageRef: step.image }) };
+      return {
+        case: 'pullImage',
+        value: create(PullImageSchema, {
+          imageRef: step.image,
+          ...pullCredentials(step.image, step.nodeId, registries),
+        }),
+      };
     case 'run_release_task':
       return {
         case: 'runReleaseTask',
@@ -111,6 +140,34 @@ export function agentAction(step: PipelineStep, secrets: SecretValues): ActionRe
         }),
       };
   }
+}
+
+/**
+ * The credentials of the image's own registry, with an expiry: the agent refuses any other
+ * registry's and any without one. Nothing is sent for a registry the organization stored nothing
+ * for, so a public image is pulled anonymously as before.
+ */
+function pullCredentials(
+  reference: string,
+  nodeId: string,
+  registries: RegistryAccess | undefined,
+): { registryCredentials?: RegistryCredentials } {
+  if (!registries) return {};
+  const image = parseImageReference(reference);
+  // Found under the name the organization stored them, sent under the name the agent reads in
+  // the reference: it accepts credentials for that registry only.
+  const login = registries.logins.get(credentialServer(image));
+  const server = pulledRegistry(image);
+  if (!login || (server === DOCKER_HUB_SERVER && registries.withoutDockerHub?.has(nodeId)))
+    return {};
+  return {
+    registryCredentials: create(RegistryCredentialsSchema, {
+      server,
+      username: login.username,
+      password: login.password.expose(),
+      expiresAt: timestampFromDate(registries.expiresAt),
+    }),
+  };
 }
 
 function containerSpec(plan: ContainerPlan, secrets: SecretValues): ContainerSpec {

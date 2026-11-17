@@ -75,6 +75,117 @@ describe('agentAction', () => {
     );
   });
 
+  describe('pulling from a private registry (ADR 0019)', () => {
+    const EXPIRES = new Date('2026-11-05T13:00:00Z');
+    const login = (server: string) => ({
+      server,
+      username: 'deploy-bot',
+      password: new Secret('sk_test_fake_registry_password'),
+    });
+    const pull = (image: string, servers: string[]) => {
+      const action = wire(
+        agentAction(step('pull_image', { image }), secrets, {
+          logins: new Map(servers.map((server) => [server, login(server)])),
+          expiresAt: EXPIRES,
+        }),
+      );
+      return action.case === 'pullImage' ? action.value : undefined;
+    };
+
+    it('sends the credentials stored for the registry the image names', () => {
+      expect(pull(IMAGE, ['ghcr.io', 'registry.example.com'])).toMatchObject({
+        imageRef: IMAGE,
+        registryCredentials: {
+          server: 'ghcr.io',
+          username: 'deploy-bot',
+          password: 'sk_test_fake_registry_password',
+          expiresAt: { seconds: BigInt(EXPIRES.getTime() / 1000), nanos: 0 },
+        },
+      });
+    });
+
+    it('sends none of another registry, whatever its name looks like', () => {
+      for (const servers of [
+        [],
+        ['registry.example.com'],
+        // Neither a prefix, a port variant nor the repository owner is the registry.
+        ['ghcr.io:443', 'ghcr.io.example.com', 'acme', 'docker.io'],
+      ])
+        expect(pull(IMAGE, servers)?.registryCredentials).toBeUndefined();
+    });
+
+    it('keeps the port of a registry apart from the same host without it', () => {
+      const image = `registry.example.com:5000/acme/billing@sha256:${'c'.repeat(64)}`;
+      expect(pull(image, ['registry.example.com'])?.registryCredentials).toBeUndefined();
+      expect(pull(image, ['registry.example.com:5000'])?.registryCredentials?.server).toBe(
+        'registry.example.com:5000',
+      );
+    });
+
+    it('sends Docker Hub credentials for an image written without a registry', () => {
+      const digest = `sha256:${'c'.repeat(64)}`;
+      for (const image of [`nginx@${digest}`, `acme/billing@${digest}`])
+        expect(pull(image, ['docker.io', 'ghcr.io'])?.registryCredentials).toMatchObject({
+          server: 'docker.io',
+        });
+      // A namespace is not a registry: `acme` credentials never go to Docker Hub.
+      expect(pull(`acme/billing@${digest}`, ['acme'])?.registryCredentials).toBeUndefined();
+    });
+
+    it('names the registry as the agent reads it when Docker Hub is written by its API host', () => {
+      // Stored as docker.io, but the agent reads `registry-1.docker.io` in this reference and
+      // accepts credentials for that name only.
+      const image = `registry-1.docker.io/acme/private@sha256:${'c'.repeat(64)}`;
+      expect(pull(image, ['docker.io'])?.registryCredentials).toMatchObject({
+        server: 'registry-1.docker.io',
+        username: 'deploy-bot',
+      });
+      expect(pull(image, ['ghcr.io'])?.registryCredentials).toBeUndefined();
+    });
+
+    it('sends no Docker Hub credentials to an agent that would refuse the whole pull', () => {
+      const digest = `sha256:${'c'.repeat(64)}`;
+      const toOldAgent = (image: string, servers: string[]) => {
+        const action = wire(
+          agentAction(step('pull_image', { image }), secrets, {
+            logins: new Map(servers.map((server) => [server, login(server)])),
+            expiresAt: EXPIRES,
+            withoutDockerHub: new Set([NODE]),
+          }),
+        );
+        return action.case === 'pullImage' ? action.value.registryCredentials : undefined;
+      };
+      // Without a registry host: the agents before the rule refuse `docker.io` for these.
+      expect(toOldAgent(`nginx@${digest}`, ['docker.io'])).toBeUndefined();
+      expect(toOldAgent(`acme/billing@${digest}`, ['docker.io'])).toBeUndefined();
+      // A registry named by a host never needed the rule.
+      expect(toOldAgent(IMAGE, ['ghcr.io'])).toMatchObject({ server: 'ghcr.io' });
+      expect(
+        toOldAgent(`registry-1.docker.io/acme/private@${digest}`, ['docker.io']),
+      ).toMatchObject({ server: 'registry-1.docker.io' });
+      // Another node, with a current agent, still gets them.
+      const other = wire(
+        agentAction(
+          { ...step('pull_image', { image: `nginx@${digest}` }), nodeId: 'another-node' },
+          secrets,
+          {
+            logins: new Map([['docker.io', login('docker.io')]]),
+            expiresAt: EXPIRES,
+            withoutDockerHub: new Set([NODE]),
+          },
+        ),
+      );
+      expect(other.case === 'pullImage' && other.value.registryCredentials?.server).toBe(
+        'docker.io',
+      );
+    });
+
+    it('sends none when no registry access is given', () => {
+      const action = wire(agentAction(step('pull_image', { image: IMAGE }), secrets));
+      expect(action.case === 'pullImage' && action.value.registryCredentials).toBeUndefined();
+    });
+  });
+
   it('maps every other step to its typed action', () => {
     const task = { ...container, port: null, restart: 'never' as const, secrets: [] };
     const actions = [

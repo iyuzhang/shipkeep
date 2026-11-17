@@ -4,6 +4,7 @@ import { Injectable } from '@nestjs/common';
 import { ConflictError, Secret } from '@shipkeep/domain';
 import { v7 as uuidv7 } from 'uuid';
 
+import { ValueDecryptionError } from '../../../platform/crypto/envelope';
 import { EnvelopeService } from '../../../platform/crypto/envelope.service';
 import { PrismaUnitOfWork } from '../../../platform/prisma/prisma-unit-of-work';
 import type { RegistryCredentialStore } from '../application/ports';
@@ -145,11 +146,23 @@ export class PrismaRegistryCredentialStore implements RegistryCredentialStore {
       where: { organizationId, server },
     });
     if (!row) return undefined;
-    const password = await this.envelope.decryptFor(
-      scope(organizationId),
-      purpose(row.server, row.version),
-      Buffer.from(row.passwordEnc),
-    );
+    let password: Buffer;
+    try {
+      password = await this.envelope.decryptFor(
+        scope(organizationId),
+        purpose(row.server, row.version),
+        Buffer.from(row.passwordEnc),
+      );
+    } catch (error: unknown) {
+      // Only a value that does not decrypt: a row that was moved or altered. A database that does
+      // not answer for the data key, or a key that is not loaded, must reach the caller as it is,
+      // so that the deployment is retried instead of asking for credentials that are fine.
+      if (!(error instanceof ValueDecryptionError)) throw error;
+      throw new ConflictError(
+        'registry_credentials_unreadable',
+        `The stored credentials for ${row.server} cannot be read; store them again.`,
+      );
+    }
     return {
       server: row.server,
       username: row.username,

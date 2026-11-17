@@ -1,5 +1,7 @@
 import { InvalidInputError } from '@shipkeep/domain';
 
+import { DOCKER_HUB_SERVER } from '../../registries/domain/registry-credential';
+
 /** Docker Hub serves its registry API from this host. */
 export const DOCKER_HUB_REGISTRY = 'registry-1.docker.io';
 /** Names people write for Docker Hub. None of them serves the registry API. */
@@ -91,6 +93,43 @@ function looksLikeHost(component: string): boolean {
 /** Docker Hub repositories are recorded without a host, and official images without `library/`. */
 function familiarHubName(path: readonly string[]): string {
   return path.length === 2 && path[0] === 'library' ? (path[1] ?? '') : path.join('/');
+}
+
+/**
+ * The name an organization stores this image's registry credentials under (ADR 0019): the
+ * registry host and port as the reference names it, and `docker.io` for Docker Hub, whose API
+ * host nobody writes.
+ */
+export function credentialServer(image: Pick<ImageReference, 'registry'>): string {
+  return image.registry === DOCKER_HUB_REGISTRY ? DOCKER_HUB_SERVER : image.registry;
+}
+
+/**
+ * The registry the agent reads in the pinned reference, with the same rule (Docker's): the first
+ * component of the name when it is a host, `docker.io` otherwise. `PullImage` credentials must
+ * carry this name, or the agent refuses the action. It differs from `credentialServer` for Docker
+ * Hub written by its API host, `registry-1.docker.io/acme/app`: stored as `docker.io`, pulled as
+ * written.
+ */
+export function pulledRegistry(image: Pick<ImageReference, 'name'>): string {
+  const slash = image.name.indexOf('/');
+  const first = slash === -1 ? '' : image.name.slice(0, slash);
+  return looksLikeHost(first) ? first : DOCKER_HUB_SERVER;
+}
+
+/** Agents released before they read a reference the way Docker does (ADR 0019). */
+const AGENTS_BEFORE_DOCKER_HUB_RULE: ReadonlySet<unknown> = new Set([
+  '0.1.0-alpha.1',
+  '0.1.0-alpha.2',
+]);
+
+/**
+ * Whether an agent of this version accepts `docker.io` credentials for a reference without a
+ * registry host. The two releases before the rule refuse the whole pull instead, so they get
+ * none: public images keep pulling anonymously, as they did before credentials existed.
+ */
+export function acceptsDockerHubCredentials(agentVersion: unknown): boolean {
+  return !AGENTS_BEFORE_DOCKER_HUB_RULE.has(agentVersion);
 }
 
 /** The digest-pinned reference the agent accepts (`PullImage`, `ContainerSpec.image_ref`). */
