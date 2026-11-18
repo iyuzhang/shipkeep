@@ -24,7 +24,7 @@ install_docker_packages() (
   local sources=$apt_dir/sources.list.d/shipkeep-docker.sources keyring=$apt_dir/keyrings/shipkeep-docker.gpg
   local -a repository_paths=("$keyring" "$sources")
   for path in "$sources" "$keyring" "$apt_dir/keyrings/shipkeep-docker.asc"; do
-    [[ ! -e $path && ! -L $path ]] || fail "Docker repository file already exists: $path. Reconcile $sources and $keyring (and any legacy $apt_dir/keyrings/shipkeep-docker.asc); if left by an interrupted installation, remove them and run this installer again."
+    [[ ! -e $path && ! -L $path ]] || fail "Docker repository file already exists: $path. Reconcile $sources and $keyring (and any legacy $apt_dir/keyrings/shipkeep-docker.asc); if confirmed left before package application, remove them and run this installer again. If package application may have started, keep them and repair the package state before retrying."
   done
   apt-get update -qq </dev/null
   apt-get install -y --no-install-recommends ca-certificates curl gnupg </dev/null
@@ -64,11 +64,14 @@ REPO
   ln -T -- "$draft_keyring" "$keyring" || fail "Cannot create Docker repository file: $keyring"
   ln -T -- "$draft_sources" "$sources" || fail "Cannot create Docker repository file: $sources"
   apt-get update -qq </dev/null
-  apt-get install -y --download-only --no-install-recommends docker-ce docker-ce-cli containerd.io </dev/null
+  install -d -m 0755 "$work/archives"
+  # Allow APT's download sandbox to traverse the workspace.
+  chmod 0711 "$work"
+  apt-get install -y -o "Dir::Cache::archives=$work/archives" --download-only --no-install-recommends docker-ce docker-ce-cli containerd.io </dev/null
   # Keep the update source once package application can leave Docker installed.
   # shellcheck disable=SC2034
   keep_repository=1
-  apt-get install -y --no-download --no-install-recommends docker-ce docker-ce-cli containerd.io </dev/null
+  apt-get install -y -o "Dir::Cache::archives=$work/archives" --no-download --no-install-recommends docker-ce docker-ce-cli containerd.io </dev/null
 )
 # The checks source this file for the functions above, and stop here.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0

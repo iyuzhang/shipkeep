@@ -2,9 +2,10 @@
 
 check_docker_repository() (
   set +e
-  local installer=$1 apt_dir=$2 status signal expected replacement
+  local installer=$1 apt_dir=$2 status signal expected replacement existing path
   local -a package_steps=()
   local sources=$apt_dir/sources.list.d/shipkeep-docker.sources keyring=$apt_dir/keyrings/shipkeep-docker.gpg
+  local legacy_keyring=$apt_dir/keyrings/shipkeep-docker.asc
   mkdir -p -- "$apt_dir/sources.list.d" "$apt_dir/keyrings" || exit
 
   run_docker_install "$installer" "$apt_dir" fail-download
@@ -63,6 +64,14 @@ check_docker_repository() (
   [[ $status == 1 && -p $sources && ! -e $keyring ]] || die 'a FIFO added during setup was not refused and preserved'
   rm -- "$sources"
 
+  run_docker_install "$installer" "$apt_dir" clean-global-cache
+  status=$?
+  [[ $status == 0 ]] || die 'cleaning the global package cache prevented Docker package application'
+  grep -q 'Simulated global package cache cleanup' "$apt_dir/output" || die 'the global package cache was not cleaned'
+  grep -Fxq -- "Signed-By: $keyring" "$sources" || die 'cache cleanup removed the update source'
+  grep -Fxq -- 'test Docker keyring' "$keyring" || die 'cache cleanup removed the signing key'
+  rm -- "$sources" "$keyring"
+
   run_docker_install "$installer" "$apt_dir" success
   status=$?
   [[ $status == 0 ]] || die 'a retry after a failed download was refused'
@@ -71,19 +80,28 @@ check_docker_repository() (
   grep -Fxq -- "Signed-By: $keyring" "$sources" || die 'a successful installation did not keep its signed repository'
   grep -Fxq -- 'test Docker keyring' "$keyring" || die 'a successful installation did not keep its signing key'
 
-  printf 'foreign repository\n' >"$sources"
-  printf 'foreign keyring\n' >"$keyring"
-  run_docker_install "$installer" "$apt_dir" success
-  status=$?
-  [[ $status == 1 ]] || die "an existing repository returned $status"
-  grep -q 'Docker repository file already exists' "$apt_dir/output" || die 'existing repository was refused without saying why'
-  grep -Fq -- "$sources" "$apt_dir/output" || die 'the refusal did not name the source to reconcile'
-  grep -Fq -- "$keyring" "$apt_dir/output" || die 'the refusal did not name the keyring to reconcile'
-  grep -q 'remove.*run.*again' "$apt_dir/output" || die 'the refusal did not explain how to retry'
-  grep -Fxq -- 'foreign repository' "$sources" || die 'an existing repository file was modified'
-  grep -Fxq -- 'foreign keyring' "$keyring" || die 'an existing keyring was modified'
-
   rm -- "$sources" "$keyring"
+  for existing in "$sources" "$keyring" "$legacy_keyring"; do
+    printf 'foreign Docker repository file\n' >"$existing"
+    run_docker_install "$installer" "$apt_dir" success
+    status=$?
+    [[ $status == 1 ]] || die "an existing repository file returned $status: $existing"
+    grep -q 'Docker repository file already exists' "$apt_dir/output" || die 'existing repository was refused without saying why'
+    grep -Fq -- "$sources" "$apt_dir/output" || die 'the refusal did not name the source to reconcile'
+    grep -Fq -- "$keyring" "$apt_dir/output" || die 'the refusal did not name the keyring to reconcile'
+    grep -Fq -- "$legacy_keyring" "$apt_dir/output" || die 'the refusal did not name the legacy keyring to reconcile'
+    grep -q 'remove.*run.*again' "$apt_dir/output" || die 'the refusal did not explain how to retry'
+    [[ ! -s $apt_dir/package-steps ]] || die 'package installation was reached despite an existing repository file'
+    for path in "$sources" "$keyring" "$legacy_keyring"; do
+      if [[ $path == "$existing" ]]; then
+        grep -Fxq -- 'foreign Docker repository file' "$path" || die "an existing repository file was modified: $path"
+      else
+        [[ ! -e $path && ! -L $path ]] || die "a refused installation created a repository file: $path"
+      fi
+    done
+    rm -- "$existing"
+  done
+
   ln -s -- "$apt_dir/missing" "$keyring"
   run_docker_install "$installer" "$apt_dir" success
   status=$?
@@ -155,6 +173,24 @@ run_docker_install() {
               [[ " $* " == *' --no-download '* ]] || return 1
               printf 'Simulated Docker package application failure\n' >&2
               return 100
+            fi
+            ;;
+          clean-global-cache)
+            local archives=$apt_dir/global-archives argument
+            for argument in "$@"; do
+              case $argument in
+                Dir::Cache::archives=*) archives=${argument#Dir::Cache::archives=} ;;
+              esac
+            done
+            if [[ " $* " == *' --download-only '* ]]; then
+              mkdir -p -- "$archives"
+              printf 'downloaded Docker package\n' >"$archives/docker.deb"
+            elif [[ " $* " == *' --no-download '* ]]; then
+              printf 'Simulated global package cache cleanup\n' >&2
+              rm -rf -- "$apt_dir/global-archives"
+              [[ -f $archives/docker.deb ]] || return 100
+            else
+              return 1
             fi
             ;;
         esac
