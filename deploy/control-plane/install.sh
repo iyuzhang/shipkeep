@@ -247,7 +247,7 @@ install_docker_packages() (
   done
   apt-get update -qq </dev/null
   apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg </dev/null >/dev/null
-  work=$(mktemp -d)
+  work=$(mktemp -d /tmp/shipkeep-docker.XXXXXX)
   trap '
     if (( ! keep_repository )); then
       for index in "${!draft_paths[@]}"; do

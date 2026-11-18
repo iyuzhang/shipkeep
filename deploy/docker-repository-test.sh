@@ -72,6 +72,14 @@ check_docker_repository() (
   grep -Fxq -- 'test Docker keyring' "$keyring" || die 'cache cleanup removed the signing key'
   rm -- "$sources" "$keyring"
 
+  run_docker_install "$installer" "$apt_dir" relative-tmpdir
+  status=$?
+  [[ $status == 0 ]] || die 'a relative TMPDIR prevented Docker package application'
+  grep -q 'Absolute Docker archive directory' "$apt_dir/output" || die 'the archive directory was not checked'
+  grep -Fxq -- "Signed-By: $keyring" "$sources" || die 'a relative TMPDIR removed the update source'
+  grep -Fxq -- 'test Docker keyring' "$keyring" || die 'a relative TMPDIR removed the signing key'
+  rm -- "$sources" "$keyring"
+
   run_docker_install "$installer" "$apt_dir" success
   status=$?
   [[ $status == 0 ]] || die 'a retry after a failed download was refused'
@@ -119,6 +127,11 @@ run_docker_install() {
 
     local sources=$2/sources.list.d/shipkeep-docker.sources keyring=$2/keyrings/shipkeep-docker.gpg
     local apt_dir=$2 failure=$3 fixture_pid=$BASHPID watchdog deadline_fd
+    if [[ $failure == relative-tmpdir ]]; then
+      cd -- "$apt_dir" || exit
+      mkdir relative-tmp
+      export TMPDIR=relative-tmp
+    fi
     : >"$apt_dir/package-steps"
     mkfifo "$2/deadline"
     exec {deadline_fd}<>"$2/deadline"
@@ -192,6 +205,16 @@ run_docker_install() {
             else
               return 1
             fi
+            ;;
+          relative-tmpdir)
+            local archives='' argument
+            for argument in "$@"; do
+              case $argument in
+                Dir::Cache::archives=*) archives=${argument#Dir::Cache::archives=} ;;
+              esac
+            done
+            [[ $archives == /* && -d $archives ]] || return 100
+            printf 'Absolute Docker archive directory\n' >&2
             ;;
         esac
       fi
