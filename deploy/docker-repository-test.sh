@@ -2,8 +2,7 @@
 
 check_docker_repository() (
   set +e
-  local installer=$1 apt_dir=$2 status signal expected replacement existing path
-  local -a package_steps=()
+  local installer=$1 apt_dir=$2 status signal expected replacement existing path scenario
   local sources=$apt_dir/sources.list.d/shipkeep-docker.sources keyring=$apt_dir/keyrings/shipkeep-docker.gpg
   local legacy_keyring=$apt_dir/keyrings/shipkeep-docker.asc
   mkdir -p -- "$apt_dir/sources.list.d" "$apt_dir/keyrings" || exit
@@ -72,19 +71,21 @@ check_docker_repository() (
   grep -Fxq -- 'test Docker keyring' "$keyring" || die 'cache cleanup removed the signing key'
   rm -- "$sources" "$keyring"
 
-  run_docker_install "$installer" "$apt_dir" relative-tmpdir
-  status=$?
-  [[ $status == 0 ]] || die 'a relative TMPDIR prevented Docker package application'
-  grep -q 'Absolute Docker archive directory' "$apt_dir/output" || die 'the archive directory was not checked'
-  grep -Fxq -- "Signed-By: $keyring" "$sources" || die 'a relative TMPDIR removed the update source'
-  grep -Fxq -- 'test Docker keyring' "$keyring" || die 'a relative TMPDIR removed the signing key'
-  rm -- "$sources" "$keyring"
+  for scenario in relative-tmpdir absolute-tmpdir; do
+    run_docker_install "$installer" "$apt_dir" "$scenario"
+    status=$?
+    [[ $status == 0 ]] || die "the configured TMPDIR prevented Docker package application: $scenario"
+    check_docker_package_steps "$apt_dir"
+    grep -q 'Configured Docker archive directory' "$apt_dir/output" || die 'the archive directory was not checked'
+    grep -Fxq -- "Signed-By: $keyring" "$sources" || die 'the configured TMPDIR removed the update source'
+    grep -Fxq -- 'test Docker keyring' "$keyring" || die 'the configured TMPDIR removed the signing key'
+    rm -- "$sources" "$keyring"
+  done
 
   run_docker_install "$installer" "$apt_dir" success
   status=$?
   [[ $status == 0 ]] || die 'a retry after a failed download was refused'
-  mapfile -t package_steps <"$apt_dir/package-steps"
-  [[ ${#package_steps[@]} == 2 && " ${package_steps[0]} " == *' --download-only '* && " ${package_steps[1]} " == *' --no-download '* ]] || die 'Docker packages were not downloaded before application'
+  check_docker_package_steps "$apt_dir"
   grep -Fxq -- "Signed-By: $keyring" "$sources" || die 'a successful installation did not keep its signed repository'
   grep -Fxq -- 'test Docker keyring' "$keyring" || die 'a successful installation did not keep its signing key'
 
@@ -126,13 +127,22 @@ run_docker_install() {
     . "$1"
 
     local sources=$2/sources.list.d/shipkeep-docker.sources keyring=$2/keyrings/shipkeep-docker.gpg
-    local apt_dir=$2 failure=$3 fixture_pid=$BASHPID watchdog deadline_fd
-    if [[ $failure == relative-tmpdir ]]; then
-      cd -- "$apt_dir" || exit
-      mkdir relative-tmp
-      export TMPDIR=relative-tmp
-    fi
+    local apt_dir=$2 failure=$3 fixture_pid=$BASHPID watchdog deadline_fd expected_tmpdir
+    case $failure in
+      relative-tmpdir)
+        cd -- "$apt_dir" || exit
+        mkdir relative-tmp
+        export TMPDIR=relative-tmp
+        expected_tmpdir=$(cd -- "$TMPDIR" && pwd -P)
+        ;;
+      absolute-tmpdir)
+        export TMPDIR="$apt_dir/absolute tmp"
+        mkdir -- "$TMPDIR"
+        expected_tmpdir=$(cd -- "$TMPDIR" && pwd -P)
+        ;;
+    esac
     : >"$apt_dir/package-steps"
+    : >"$apt_dir/package-archives"
     mkfifo "$2/deadline"
     exec {deadline_fd}<>"$2/deadline"
     rm -- "$2/deadline"
@@ -162,6 +172,13 @@ run_docker_install() {
       fi
       if [[ " $* " == *' docker-ce '* ]]; then
         printf '%s\n' "$*" >>"$apt_dir/package-steps"
+        local archives=$apt_dir/global-archives argument
+        for argument in "$@"; do
+          case $argument in
+            Dir::Cache::archives=*) archives=${argument#Dir::Cache::archives=} ;;
+          esac
+        done
+        printf '%s\n' "$archives" >>"$apt_dir/package-archives"
         case $failure in
           fail-download)
             printf 'Simulated Docker download failure\n' >&2
@@ -189,12 +206,6 @@ run_docker_install() {
             fi
             ;;
           clean-global-cache)
-            local archives=$apt_dir/global-archives argument
-            for argument in "$@"; do
-              case $argument in
-                Dir::Cache::archives=*) archives=${argument#Dir::Cache::archives=} ;;
-              esac
-            done
             if [[ " $* " == *' --download-only '* ]]; then
               mkdir -p -- "$archives"
               printf 'downloaded Docker package\n' >"$archives/docker.deb"
@@ -206,15 +217,9 @@ run_docker_install() {
               return 1
             fi
             ;;
-          relative-tmpdir)
-            local archives='' argument
-            for argument in "$@"; do
-              case $argument in
-                Dir::Cache::archives=*) archives=${argument#Dir::Cache::archives=} ;;
-              esac
-            done
-            [[ $archives == /* && -d $archives ]] || return 100
-            printf 'Absolute Docker archive directory\n' >&2
+          relative-tmpdir|absolute-tmpdir)
+            [[ $archives == "$expected_tmpdir/"* && -d $archives ]] || return 100
+            printf 'Configured Docker archive directory\n' >&2
             ;;
         esac
       fi
@@ -224,4 +229,12 @@ run_docker_install() {
   ) >"$2/output" 2>&1
   local status=$?
   return "$status"
+}
+
+check_docker_package_steps() {
+  local -a package_steps=() package_archives=()
+  mapfile -t package_steps <"$1/package-steps"
+  mapfile -t package_archives <"$1/package-archives"
+  [[ ${#package_steps[@]} == 2 && " ${package_steps[0]} " == *' --download-only '* && " ${package_steps[1]} " == *' --no-download '* ]] || die 'Docker packages were not downloaded before application'
+  [[ ${#package_archives[@]} == 2 && ${package_archives[0]} == /* && ${package_archives[0]} == "${package_archives[1]}" ]] || die 'Docker package phases used different or relative archive directories'
 }

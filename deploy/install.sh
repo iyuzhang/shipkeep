@@ -19,7 +19,7 @@ single_signing_key() {
 }
 install_docker_packages() (
   # shellcheck disable=SC2034
-  local apt_dir=$1 work path index draft_keyring draft_sources keep_repository=0
+  local apt_dir=$1 work work_parent path index draft_keyring draft_sources keep_repository=0
   local -a draft_paths=()
   local sources=$apt_dir/sources.list.d/shipkeep-docker.sources keyring=$apt_dir/keyrings/shipkeep-docker.gpg
   local -a repository_paths=("$keyring" "$sources")
@@ -28,7 +28,8 @@ install_docker_packages() (
   done
   apt-get update -qq </dev/null
   apt-get install -y --no-install-recommends ca-certificates curl gnupg </dev/null
-  work=$(mktemp -d /tmp/shipkeep-docker.XXXXXX)
+  work_parent=$(realpath -e -- "${TMPDIR:-/tmp}")
+  work=$(mktemp -d "$work_parent/shipkeep-docker.XXXXXX")
   trap '
     if (( ! keep_repository )); then
       for index in "${!draft_paths[@]}"; do
