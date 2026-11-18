@@ -3,6 +3,25 @@
 set +ax
 set -euo pipefail
 fail() { printf 'shipkeep-install: %s\n' "$1" >&2; exit 1; }
+# Returns a canonical temporary directory whose ancestors cannot be replaced by other users.
+trusted_temporary_directory() {
+  local directory path=/ part owner mode
+  local -a parts
+  IFS= read -r -d '' directory < <(realpath -ez -- "${TMPDIR:-/tmp}") || fail 'Cannot resolve the temporary directory.'
+  [[ $directory != *$'\n'* ]] || fail 'The temporary directory path must not contain a newline.'
+  IFS=/ read -r -a parts <<<"${directory#/}" || fail 'Cannot inspect the temporary directory path.'
+  for part in '' "${parts[@]}"; do
+    [[ -z $part ]] || path=${path%/}/$part
+    [[ ! -L $path && -d $path ]] || fail "$path must be a directory, not a link."
+    owner=$(stat -c %u -- "$path") || fail "Cannot inspect the owner of $path."
+    mode=$(stat -c %a -- "$path") || fail "Cannot inspect the permissions of $path."
+    [[ $owner == 0 && $mode =~ ^[0-7]{1,4}$ ]] || fail "$path must belong to root."
+    if (( (8#$mode & 8#22) && !(8#$mode & 8#1000) )); then
+      fail "$path must be writable by root only, or have the sticky bit set."
+    fi
+  done
+  printf '%s\n' "$directory"
+}
 # Writes to $2 a keyring that holds the key with fingerprint $3 and nothing else, taken from the
 # downloaded file $1. It fails unless that file holds exactly this one key: apt trusts every key
 # of the keyring a repository names, so a second key in the download would be trusted too.
@@ -26,9 +45,10 @@ install_docker_packages() (
   for path in "$sources" "$keyring" "$apt_dir/keyrings/shipkeep-docker.asc"; do
     [[ ! -e $path && ! -L $path ]] || fail "Docker repository file already exists: $path. Reconcile $sources and $keyring (and any legacy $apt_dir/keyrings/shipkeep-docker.asc); if confirmed left before package application, remove them and run this installer again. If package application may have started, keep them and repair the package state before retrying."
   done
+  work_parent=$(trusted_temporary_directory) || exit 1
+  export TMPDIR=$work_parent
   apt-get update -qq </dev/null
   apt-get install -y --no-install-recommends ca-certificates curl gnupg </dev/null
-  work_parent=$(realpath -e -- "${TMPDIR:-/tmp}")
   work=$(mktemp -d "$work_parent/shipkeep-docker.XXXXXX")
   trap '
     if (( ! keep_repository )); then
@@ -44,6 +64,7 @@ install_docker_packages() (
   ' EXIT
   trap 'exit 129' HUP
   trap 'exit 143' TERM
+  printf 'Docker package workspace: %s\n' "$work" >&2
   curl --fail --silent --show-error --proto '=https' --max-time 60 https://download.docker.com/linux/ubuntu/gpg -o "$work/docker.asc"
   single_signing_key "$work/docker.asc" "$work/docker.gpg" 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 || fail 'Docker signing key mismatch.'
   install -d -m 0755 "$apt_dir/keyrings"
@@ -97,6 +118,8 @@ port=${control_plane##*:}
 [[ $fingerprint =~ ^sha256:[a-f0-9]{64}$ && $amd64 =~ ^[a-f0-9]{64}$ && $arm64 =~ ^[a-f0-9]{64}$ ]] || fail 'Invalid SHA-256 pin.'
 [[ $origin =~ ^https://([a-zA-Z0-9.-]+|\[[a-fA-F0-9:]+\])(:[0-9]{1,5})?$ ]] || fail 'An HTTPS control-plane origin is required.'
 ((EUID == 0)) || fail 'Run with sudo.'
+TMPDIR=$(trusted_temporary_directory) || exit 1
+export TMPDIR
 [[ -d /run/systemd/system ]] || fail 'A systemd host is required.'
 # shellcheck source=/dev/null
 . /etc/os-release

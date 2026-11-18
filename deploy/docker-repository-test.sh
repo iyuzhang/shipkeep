@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 
+# shellcheck source=deploy/temporary-directory-test.sh
+. "${BASH_SOURCE[0]%/*}/temporary-directory-test.sh"
+
 check_docker_repository() (
   set +e
   local installer=$1 apt_dir=$2 status signal expected replacement existing path scenario
   local sources=$apt_dir/sources.list.d/shipkeep-docker.sources keyring=$apt_dir/keyrings/shipkeep-docker.gpg
   local legacy_keyring=$apt_dir/keyrings/shipkeep-docker.asc
   mkdir -p -- "$apt_dir/sources.list.d" "$apt_dir/keyrings" || exit
+
+  check_trusted_temporary_directory "$installer" "$apt_dir"
+  status=$?
+  [[ $status == 0 ]] || die 'temporary directory trust checks failed'
+
+  run_docker_install "$installer" "$apt_dir" unsafe-tmpdir
+  status=$?
+  [[ $status == 1 ]] || die "an unsafe temporary directory returned $status"
+  [[ ! -s $apt_dir/boundary-calls ]] || die 'an unsafe temporary directory reached package setup or workspace creation'
+  [[ ! -e $sources && ! -e $keyring ]] || die 'an unsafe temporary directory published repository files'
+  [[ -z $(find "$apt_dir/unsafe-tmp" -mindepth 1 -print -quit) ]] || die 'an unsafe temporary directory was used as a workspace'
 
   run_docker_install "$installer" "$apt_dir" fail-download
   status=$?
@@ -128,21 +142,31 @@ run_docker_install() {
 
     local sources=$2/sources.list.d/shipkeep-docker.sources keyring=$2/keyrings/shipkeep-docker.gpg
     local apt_dir=$2 failure=$3 fixture_pid=$BASHPID watchdog deadline_fd expected_tmpdir
+    export TMPDIR=/tmp
     case $failure in
       relative-tmpdir)
         cd -- "$apt_dir" || exit
         mkdir relative-tmp
         export TMPDIR=relative-tmp
-        expected_tmpdir=$(cd -- "$TMPDIR" && pwd -P)
+        expected_tmpdir=$(CDPATH='' cd -- "$TMPDIR" && pwd -P)
         ;;
       absolute-tmpdir)
         export TMPDIR="$apt_dir/absolute tmp"
         mkdir -- "$TMPDIR"
-        expected_tmpdir=$(cd -- "$TMPDIR" && pwd -P)
+        expected_tmpdir=$(CDPATH='' cd -- "$TMPDIR" && pwd -P)
+        ;;
+      unsafe-tmpdir)
+        export TMPDIR="$apt_dir/unsafe-tmp"
+        mkdir -- "$TMPDIR"
         ;;
     esac
+    if [[ $failure == relative-tmpdir || $failure == absolute-tmpdir ]]; then
+      # shellcheck disable=SC2329
+      trusted_temporary_directory() { printf '%s\n' "$expected_tmpdir"; }
+    fi
     : >"$apt_dir/package-steps"
     : >"$apt_dir/package-archives"
+    : >"$apt_dir/boundary-calls"
     mkfifo "$2/deadline"
     exec {deadline_fd}<>"$2/deadline"
     rm -- "$2/deadline"
@@ -153,9 +177,17 @@ run_docker_install() {
     trap 'kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; exec {deadline_fd}>&-' EXIT
 
     # shellcheck disable=SC2329
-    curl() { :; }
+    curl() { printf 'curl\n' >>"$apt_dir/boundary-calls"; }
+    # shellcheck disable=SC2329
+    mktemp() {
+      printf 'mktemp\n' >>"$apt_dir/boundary-calls"
+      command mktemp "$@"
+    }
     # shellcheck disable=SC2329
     single_signing_key() {
+      if [[ $failure == relative-tmpdir || $failure == absolute-tmpdir ]]; then
+        [[ $TMPDIR == "$expected_tmpdir" ]] || return 1
+      fi
       [[ $3 == 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 ]] || return 1
       printf 'test Docker keyring\n' >"$2"
       if [[ $failure == appear-during-setup ]]; then
@@ -166,6 +198,7 @@ run_docker_install() {
     }
     # shellcheck disable=SC2329
     apt-get() {
+      printf 'apt-get\n' >>"$apt_dir/boundary-calls"
       if [[ $1 == update && $failure == fail-update && -f $sources ]]; then
         printf 'Simulated Docker repository update failure\n' >&2
         return 100

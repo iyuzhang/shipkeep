@@ -11,6 +11,26 @@ fail() {
   exit 1
 }
 
+# Returns a canonical temporary directory whose ancestors cannot be replaced by other users.
+trusted_temporary_directory() {
+  local directory path=/ part owner mode
+  local -a parts
+  IFS= read -r -d '' directory < <(realpath -ez -- "${TMPDIR:-/tmp}") || fail 'Cannot resolve the temporary directory.'
+  [[ $directory != *$'\n'* ]] || fail 'The temporary directory path must not contain a newline.'
+  IFS=/ read -r -a parts <<<"${directory#/}" || fail 'Cannot inspect the temporary directory path.'
+  for part in '' "${parts[@]}"; do
+    [[ -z $part ]] || path=${path%/}/$part
+    [[ ! -L $path && -d $path ]] || fail "$path must be a directory, not a link."
+    owner=$(stat -c %u -- "$path") || fail "Cannot inspect the owner of $path."
+    mode=$(stat -c %a -- "$path") || fail "Cannot inspect the permissions of $path."
+    [[ $owner == 0 && $mode =~ ^[0-7]{1,4}$ ]] || fail "$path must belong to root."
+    if (( (8#$mode & 8#22) && !(8#$mode & 8#1000) )); then
+      fail "$path must be writable by root only, or have the sticky bit set."
+    fi
+  done
+  printf '%s\n' "$directory"
+}
+
 valid_directory() {
   [[ $1 =~ ^/[A-Za-z0-9._/-]{1,200}$ && $1 != */ && $1 != *//* && ! $1 =~ (^|/)\.\.?(/|$) ]]
 }
@@ -245,9 +265,10 @@ install_docker_packages() (
   for path in "$sources" "$keyring" "$apt_dir/keyrings/shipkeep-docker.asc"; do
     [[ ! -e $path && ! -L $path ]] || fail "Docker repository file already exists: $path. Reconcile $sources and $keyring (and any legacy $apt_dir/keyrings/shipkeep-docker.asc); if confirmed left before package application, remove them and run this installer again. If package application may have started, keep them and repair the package state before retrying."
   done
+  work_parent=$(trusted_temporary_directory) || exit 1
+  export TMPDIR=$work_parent
   apt-get update -qq </dev/null
   apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg </dev/null >/dev/null
-  work_parent=$(realpath -e -- "${TMPDIR:-/tmp}")
   work=$(mktemp -d "$work_parent/shipkeep-docker.XXXXXX")
   trap '
     if (( ! keep_repository )); then
@@ -263,6 +284,7 @@ install_docker_packages() (
   ' EXIT
   trap 'exit 129' HUP
   trap 'exit 143' TERM
+  printf 'Docker package workspace: %s\n' "$work" >&2
   curl --fail --silent --show-error --proto '=https' --max-time 60 https://download.docker.com/linux/ubuntu/gpg -o "$work/docker.asc"
   single_signing_key "$work/docker.asc" "$work/docker.gpg" 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 || fail 'Docker signing key mismatch.'
   install -d -m 0755 "$apt_dir/keyrings"
@@ -364,6 +386,8 @@ main() {
 
   # Everything up to the questions only reads: a refusal leaves the machine as it was.
   ((EUID == 0)) || fail 'Run with sudo.'
+  TMPDIR=$(trusted_temporary_directory) || exit 1
+  export TMPDIR
   [[ $(uname -s) == Linux ]] || fail 'A Linux machine is required.'
   case $(uname -m) in x86_64 | aarch64) ;; *) fail 'Unsupported architecture: the image is built for amd64 and arm64.' ;; esac
   here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
