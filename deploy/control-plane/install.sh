@@ -237,16 +237,31 @@ create_first_account() {
 }
 
 install_docker_packages() (
-  local apt_dir=$1 work path draft_keyring draft_sources
-  local -a created_paths=() draft_paths=()
+  # shellcheck disable=SC2034
+  local apt_dir=$1 work path index draft_keyring draft_sources keep_repository=0
+  local -a draft_paths=()
   local sources=$apt_dir/sources.list.d/shipkeep-docker.sources keyring=$apt_dir/keyrings/shipkeep-docker.gpg
+  local -a repository_paths=("$keyring" "$sources")
   for path in "$sources" "$keyring" "$apt_dir/keyrings/shipkeep-docker.asc"; do
-    [[ ! -e $path && ! -L $path ]] || fail "Docker repository file already exists: $path"
+    [[ ! -e $path && ! -L $path ]] || fail "Docker repository file already exists: $path. Reconcile $sources and $keyring (and any legacy $apt_dir/keyrings/shipkeep-docker.asc); if left by an interrupted installation, remove them and run this installer again."
   done
   apt-get update -qq </dev/null
   apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg </dev/null >/dev/null
   work=$(mktemp -d)
-  trap 'rm -f -- "${created_paths[@]}" "${draft_paths[@]}"; rm -rf -- "$work"' EXIT
+  trap '
+    if (( ! keep_repository )); then
+      for index in "${!draft_paths[@]}"; do
+        path=${repository_paths[index]}
+        if [[ ! -L $path && $path -ef ${draft_paths[index]} ]]; then
+          rm -f -- "$path"
+        fi
+      done
+    fi
+    rm -f -- "${draft_paths[@]}"
+    rm -rf -- "$work"
+  ' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 143' TERM
   curl --fail --silent --show-error --proto '=https' --max-time 60 https://download.docker.com/linux/ubuntu/gpg -o "$work/docker.asc"
   single_signing_key "$work/docker.asc" "$work/docker.gpg" 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 || fail 'Docker signing key mismatch.'
   install -d -m 0755 "$apt_dir/keyrings"
@@ -266,12 +281,13 @@ Signed-By: $keyring
 REPO
   chmod 0644 "$draft_sources"
   ln -T -- "$draft_keyring" "$keyring" || fail "Cannot create Docker repository file: $keyring"
-  created_paths+=("$keyring")
   ln -T -- "$draft_sources" "$sources" || fail "Cannot create Docker repository file: $sources"
-  created_paths=("$sources" "$keyring")
   apt-get update -qq </dev/null
-  apt-get install -y -qq --no-install-recommends docker-ce docker-ce-cli containerd.io docker-compose-plugin </dev/null >/dev/null
-  created_paths=()
+  apt-get install -y -qq --download-only --no-install-recommends docker-ce docker-ce-cli containerd.io docker-compose-plugin </dev/null >/dev/null
+  # Keep the update source once package application can leave Docker installed.
+  # shellcheck disable=SC2034
+  keep_repository=1
+  apt-get install -y -qq --no-download --no-install-recommends docker-ce docker-ce-cli containerd.io docker-compose-plugin </dev/null >/dev/null
 )
 
 # Ubuntu 24.04 only, from Docker's own repository, with its signing key pinned (as the server
