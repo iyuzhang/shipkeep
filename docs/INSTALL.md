@@ -165,6 +165,7 @@ The installer does not upgrade. Change `SHIPKEEP_IMAGE` in `.env` to the new rel
 ## Troubleshooting
 
 - **The installer refuses to start:** it names the reason (a busy port, a name that does not resolve, a directory that is not root's alone or lies below one, an earlier installation or its Docker volumes) and has changed nothing. Fix it and run the installer again. One refusal comes later: when Docker was removed and the volumes of an earlier installation remain, they only show once the installer has put Docker back.
+- **Docker packages could not be downloaded:** both installers remove the Docker apt source and keyring they added during this attempt. Run the same installer again once the network is back.
 - **The installer stopped while starting the stack:** it prints the command that finishes the installation. Keep `.env`: the database is created with the passwords it holds, and the installer will not run a second time on this directory.
 - **`migrate` or `database-role` exited with an error:** `docker compose logs migrate database-role`. A changed `POSTGRES_APP_PASSWORD` is the usual cause: an existing login keeps its password, so put the original value back.
 - **`control-plane` keeps restarting:** `docker compose logs control-plane`. The first line names every invalid or missing setting.

@@ -17,6 +17,43 @@ single_signing_key() {
   rm -rf -- "$home"
   return "$status"
 }
+install_docker_packages() (
+  local apt_dir=$1 work path draft_keyring draft_sources
+  local -a created_paths=() draft_paths=()
+  local sources=$apt_dir/sources.list.d/shipkeep-docker.sources keyring=$apt_dir/keyrings/shipkeep-docker.gpg
+  for path in "$sources" "$keyring" "$apt_dir/keyrings/shipkeep-docker.asc"; do
+    [[ ! -e $path && ! -L $path ]] || fail "Docker repository file already exists: $path"
+  done
+  apt-get update -qq </dev/null
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg </dev/null
+  work=$(mktemp -d)
+  trap 'rm -f -- "${created_paths[@]}" "${draft_paths[@]}"; rm -rf -- "$work"' EXIT
+  curl --fail --silent --show-error --proto '=https' --max-time 60 https://download.docker.com/linux/ubuntu/gpg -o "$work/docker.asc"
+  single_signing_key "$work/docker.asc" "$work/docker.gpg" 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 || fail 'Docker signing key mismatch.'
+  install -d -m 0755 "$apt_dir/keyrings"
+  # Stage each file in its destination directory so linking cannot replace an existing path.
+  draft_keyring=$(mktemp "$apt_dir/keyrings/.shipkeep-docker.XXXXXX")
+  draft_paths+=("$draft_keyring")
+  install -m 0644 "$work/docker.gpg" "$draft_keyring"
+  draft_sources=$(mktemp "$apt_dir/sources.list.d/.shipkeep-docker.XXXXXX")
+  draft_paths+=("$draft_sources")
+  cat >"$draft_sources" <<REPO
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: noble
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: $keyring
+REPO
+  chmod 0644 "$draft_sources"
+  ln -T -- "$draft_keyring" "$keyring" || fail "Cannot create Docker repository file: $keyring"
+  created_paths+=("$keyring")
+  ln -T -- "$draft_sources" "$sources" || fail "Cannot create Docker repository file: $sources"
+  created_paths=("$sources" "$keyring")
+  apt-get update -qq </dev/null
+  apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io </dev/null
+  created_paths=()
+)
 # The checks source this file for the functions above, and stop here.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 umask 077
@@ -66,28 +103,14 @@ cleanup() { rm -rf -- "$work"; }
 trap cleanup EXIT
 # Never consume the token until package installation and validation have succeeded.
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq </dev/null
-apt-get install -y --no-install-recommends ca-certificates curl gnupg </dev/null
 if ! command -v docker >/dev/null; then
   for package in docker.io podman-docker containerd runc; do
     ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || fail 'Conflicting Docker packages; reconcile them manually.'
   done
-  [[ ! -e /etc/apt/sources.list.d/shipkeep-docker.sources && ! -e /etc/apt/keyrings/shipkeep-docker.gpg && ! -e /etc/apt/keyrings/shipkeep-docker.asc ]] || fail 'Docker repository files already exist.'
-  curl --fail --silent --show-error --proto '=https' --max-time 60 https://download.docker.com/linux/ubuntu/gpg -o "$work/docker.asc"
-  single_signing_key "$work/docker.asc" "$work/docker.gpg" 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 || fail 'Docker signing key mismatch.'
-  install -d -m 0755 /etc/apt/keyrings
-  install -m 0644 "$work/docker.gpg" /etc/apt/keyrings/shipkeep-docker.gpg
-  cat > /etc/apt/sources.list.d/shipkeep-docker.sources <<REPO
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: noble
-Components: stable
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/shipkeep-docker.gpg
-REPO
-  chmod 0644 /etc/apt/sources.list.d/shipkeep-docker.sources
+  install_docker_packages /etc/apt
+else
   apt-get update -qq </dev/null
-  apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io </dev/null
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg </dev/null
 fi
 systemctl enable --now docker
 # The agent pins Docker API 1.47. Do not silently replace an incompatible existing daemon.
