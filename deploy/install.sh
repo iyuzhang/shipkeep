@@ -22,6 +22,10 @@ trusted_temporary_directory() {
   done
   printf '%s\n' "$directory"
 }
+# Checks directory traversal with APT's own sandbox credentials.
+assert_apt_directory() {
+  /usr/lib/apt/apt-helper -o APT::Sandbox::User=_apt drop-privs -- /usr/bin/test -x "$1" || fail "$1 must be searchable by APT's sandbox user (_apt)."
+}
 # Writes to $2 a keyring that holds the key with fingerprint $3 and nothing else, taken from the
 # downloaded file $1. It fails unless that file holds exactly this one key: apt trusts every key
 # of the keyring a repository names, so a second key in the download would be trusted too.
@@ -46,6 +50,7 @@ install_docker_packages() (
     [[ ! -e $path && ! -L $path ]] || fail "Docker repository file already exists: $path. Reconcile $sources and $keyring (and any legacy $apt_dir/keyrings/shipkeep-docker.asc); if confirmed left before package application, remove them and run this installer again. If package application may have started, keep them and repair the package state before retrying."
   done
   work_parent=$(trusted_temporary_directory) || exit 1
+  assert_apt_directory "$work_parent"
   export TMPDIR=$work_parent
   apt-get update -qq </dev/null
   apt-get install -y --no-install-recommends ca-certificates curl gnupg </dev/null
@@ -89,6 +94,7 @@ REPO
   install -d -m 0755 "$work/archives"
   # Allow APT's download sandbox to traverse the workspace.
   chmod 0711 "$work"
+  assert_apt_directory "$work/archives"
   apt-get install -y -o "Dir::Cache::archives=$work/archives" --download-only --no-install-recommends docker-ce docker-ce-cli containerd.io </dev/null
   # Keep the update source once package application can leave Docker installed.
   # shellcheck disable=SC2034

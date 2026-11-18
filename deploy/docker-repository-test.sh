@@ -21,6 +21,12 @@ check_docker_repository() (
   [[ ! -e $sources && ! -e $keyring ]] || die 'an unsafe temporary directory published repository files'
   [[ -z $(find "$apt_dir/unsafe-tmp" -mindepth 1 -print -quit) ]] || die 'an unsafe temporary directory was used as a workspace'
 
+  run_docker_install "$installer" "$apt_dir" sandbox-inaccessible
+  status=$?
+  [[ $status == 1 ]] || die "an inaccessible temporary directory returned $status"
+  [[ ! -s $apt_dir/boundary-calls ]] || die 'an inaccessible temporary directory reached package setup or workspace creation'
+  [[ ! -e $sources && ! -e $keyring ]] || die 'an inaccessible temporary directory published repository files'
+
   run_docker_install "$installer" "$apt_dir" fail-download
   status=$?
   [[ $status == 100 ]] || die "Docker download failure returned $status"
@@ -141,7 +147,7 @@ run_docker_install() {
     . "$1"
 
     local sources=$2/sources.list.d/shipkeep-docker.sources keyring=$2/keyrings/shipkeep-docker.gpg
-    local apt_dir=$2 failure=$3 fixture_pid=$BASHPID watchdog deadline_fd expected_tmpdir
+    local apt_dir=$2 failure=$3 fixture_pid=$BASHPID watchdog deadline_fd expected_tmpdir inaccessible_tmpdir=''
     export TMPDIR=/tmp
     case $failure in
       relative-tmpdir)
@@ -159,8 +165,14 @@ run_docker_install() {
         export TMPDIR="$apt_dir/unsafe-tmp"
         mkdir -- "$TMPDIR"
         ;;
+      sandbox-inaccessible)
+        export TMPDIR="$apt_dir/sandbox-inaccessible"
+        mkdir -- "$TMPDIR"
+        expected_tmpdir=$TMPDIR
+        inaccessible_tmpdir=$TMPDIR
+        ;;
     esac
-    if [[ $failure == relative-tmpdir || $failure == absolute-tmpdir ]]; then
+    if [[ $failure == relative-tmpdir || $failure == absolute-tmpdir || $failure == sandbox-inaccessible ]]; then
       # shellcheck disable=SC2329
       trusted_temporary_directory() { printf '%s\n' "$expected_tmpdir"; }
     fi
@@ -174,7 +186,8 @@ run_docker_install() {
       IFS= read -r -t 10 -u "$deadline_fd" || kill -KILL -- "-$fixture_pid"
     ) &
     watchdog=$!
-    trap 'kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; exec {deadline_fd}>&-' EXIT
+    trap 'if [[ -n $inaccessible_tmpdir ]]; then chmod 0700 "$inaccessible_tmpdir"; fi; kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; exec {deadline_fd}>&-' EXIT
+    if [[ -n $inaccessible_tmpdir ]]; then chmod 0000 "$inaccessible_tmpdir"; fi
 
     # shellcheck disable=SC2329
     curl() { printf 'curl\n' >>"$apt_dir/boundary-calls"; }
