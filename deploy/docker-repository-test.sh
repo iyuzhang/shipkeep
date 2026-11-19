@@ -1,31 +1,11 @@
 #!/usr/bin/env bash
 
-# shellcheck source=deploy/temporary-directory-test.sh
-. "${BASH_SOURCE[0]%/*}/temporary-directory-test.sh"
-
 check_docker_repository() (
   set +e
-  local installer=$1 apt_dir=$2 status signal expected replacement existing path scenario
+  local installer=$1 apt_dir=$2 status signal expected replacement existing path
   local sources=$apt_dir/sources.list.d/shipkeep-docker.sources keyring=$apt_dir/keyrings/shipkeep-docker.gpg
   local legacy_keyring=$apt_dir/keyrings/shipkeep-docker.asc
   mkdir -p -- "$apt_dir/sources.list.d" "$apt_dir/keyrings" || exit
-
-  check_trusted_temporary_directory "$installer" "$apt_dir"
-  status=$?
-  [[ $status == 0 ]] || die 'temporary directory trust checks failed'
-
-  run_docker_install "$installer" "$apt_dir" unsafe-tmpdir
-  status=$?
-  [[ $status == 1 ]] || die "an unsafe temporary directory returned $status"
-  [[ ! -s $apt_dir/boundary-calls ]] || die 'an unsafe temporary directory reached package setup or workspace creation'
-  [[ ! -e $sources && ! -e $keyring ]] || die 'an unsafe temporary directory published repository files'
-  [[ -z $(find "$apt_dir/unsafe-tmp" -mindepth 1 -print -quit) ]] || die 'an unsafe temporary directory was used as a workspace'
-
-  run_docker_install "$installer" "$apt_dir" sandbox-inaccessible
-  status=$?
-  [[ $status == 1 ]] || die "an inaccessible temporary directory returned $status"
-  [[ ! -s $apt_dir/boundary-calls ]] || die 'an inaccessible temporary directory reached package setup or workspace creation'
-  [[ ! -e $sources && ! -e $keyring ]] || die 'an inaccessible temporary directory published repository files'
 
   run_docker_install "$installer" "$apt_dir" fail-download
   status=$?
@@ -83,25 +63,6 @@ check_docker_repository() (
   [[ $status == 1 && -p $sources && ! -e $keyring ]] || die 'a FIFO added during setup was not refused and preserved'
   rm -- "$sources"
 
-  run_docker_install "$installer" "$apt_dir" clean-global-cache
-  status=$?
-  [[ $status == 0 ]] || die 'cleaning the global package cache prevented Docker package application'
-  grep -q 'Simulated global package cache cleanup' "$apt_dir/output" || die 'the global package cache was not cleaned'
-  grep -Fxq -- "Signed-By: $keyring" "$sources" || die 'cache cleanup removed the update source'
-  grep -Fxq -- 'test Docker keyring' "$keyring" || die 'cache cleanup removed the signing key'
-  rm -- "$sources" "$keyring"
-
-  for scenario in relative-tmpdir absolute-tmpdir; do
-    run_docker_install "$installer" "$apt_dir" "$scenario"
-    status=$?
-    [[ $status == 0 ]] || die "the configured TMPDIR prevented Docker package application: $scenario"
-    check_docker_package_steps "$apt_dir"
-    grep -q 'Configured Docker archive directory' "$apt_dir/output" || die 'the archive directory was not checked'
-    grep -Fxq -- "Signed-By: $keyring" "$sources" || die 'the configured TMPDIR removed the update source'
-    grep -Fxq -- 'test Docker keyring' "$keyring" || die 'the configured TMPDIR removed the signing key'
-    rm -- "$sources" "$keyring"
-  done
-
   run_docker_install "$installer" "$apt_dir" success
   status=$?
   [[ $status == 0 ]] || die 'a retry after a failed download was refused'
@@ -147,38 +108,10 @@ run_docker_install() {
     . "$1"
 
     local sources=$2/sources.list.d/shipkeep-docker.sources keyring=$2/keyrings/shipkeep-docker.gpg
-    local apt_dir=$2 failure=$3 fixture_pid=$BASHPID watchdog deadline_fd expected_tmpdir inaccessible_tmpdir=''
-    export TMPDIR=/tmp
-    case $failure in
-      relative-tmpdir)
-        cd -- "$apt_dir" || exit
-        mkdir relative-tmp
-        export TMPDIR=relative-tmp
-        expected_tmpdir=$(CDPATH='' cd -- "$TMPDIR" && pwd -P)
-        ;;
-      absolute-tmpdir)
-        export TMPDIR="$apt_dir/absolute tmp"
-        mkdir -- "$TMPDIR"
-        expected_tmpdir=$(CDPATH='' cd -- "$TMPDIR" && pwd -P)
-        ;;
-      unsafe-tmpdir)
-        export TMPDIR="$apt_dir/unsafe-tmp"
-        mkdir -- "$TMPDIR"
-        ;;
-      sandbox-inaccessible)
-        export TMPDIR="$apt_dir/sandbox-inaccessible"
-        mkdir -- "$TMPDIR"
-        expected_tmpdir=$TMPDIR
-        inaccessible_tmpdir=$TMPDIR
-        ;;
-    esac
-    if [[ $failure == relative-tmpdir || $failure == absolute-tmpdir || $failure == sandbox-inaccessible ]]; then
-      # shellcheck disable=SC2329
-      trusted_temporary_directory() { printf '%s\n' "$expected_tmpdir"; }
-    fi
+    local apt_dir=$2 failure=$3 fixture_pid=$BASHPID watchdog deadline_fd
+    export TMPDIR="$apt_dir/custom-tmp"
+    mkdir -p -- "$TMPDIR"
     : >"$apt_dir/package-steps"
-    : >"$apt_dir/package-archives"
-    : >"$apt_dir/boundary-calls"
     mkfifo "$2/deadline"
     exec {deadline_fd}<>"$2/deadline"
     rm -- "$2/deadline"
@@ -186,21 +119,13 @@ run_docker_install() {
       IFS= read -r -t 10 -u "$deadline_fd" || kill -KILL -- "-$fixture_pid"
     ) &
     watchdog=$!
-    trap 'if [[ -n $inaccessible_tmpdir ]]; then chmod 0700 "$inaccessible_tmpdir"; fi; kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; exec {deadline_fd}>&-' EXIT
-    if [[ -n $inaccessible_tmpdir ]]; then chmod 0000 "$inaccessible_tmpdir"; fi
+    trap 'kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true; exec {deadline_fd}>&-' EXIT
 
     # shellcheck disable=SC2329
-    curl() { printf 'curl\n' >>"$apt_dir/boundary-calls"; }
-    # shellcheck disable=SC2329
-    mktemp() {
-      printf 'mktemp\n' >>"$apt_dir/boundary-calls"
-      command mktemp "$@"
-    }
+    curl() { return 0; }
     # shellcheck disable=SC2329
     single_signing_key() {
-      if [[ $failure == relative-tmpdir || $failure == absolute-tmpdir ]]; then
-        [[ $TMPDIR == "$expected_tmpdir" ]] || return 1
-      fi
+      [[ $2 != "$TMPDIR/"* && $(stat -c %a -- "${2%/*}") == 700 ]] || return 1
       [[ $3 == 9DC858229FC7DD38854AE2D88D81803C0EBFCD88 ]] || return 1
       printf 'test Docker keyring\n' >"$2"
       if [[ $failure == appear-during-setup ]]; then
@@ -211,20 +136,12 @@ run_docker_install() {
     }
     # shellcheck disable=SC2329
     apt-get() {
-      printf 'apt-get\n' >>"$apt_dir/boundary-calls"
       if [[ $1 == update && $failure == fail-update && -f $sources ]]; then
         printf 'Simulated Docker repository update failure\n' >&2
         return 100
       fi
       if [[ " $* " == *' docker-ce '* ]]; then
         printf '%s\n' "$*" >>"$apt_dir/package-steps"
-        local archives=$apt_dir/global-archives argument
-        for argument in "$@"; do
-          case $argument in
-            Dir::Cache::archives=*) archives=${argument#Dir::Cache::archives=} ;;
-          esac
-        done
-        printf '%s\n' "$archives" >>"$apt_dir/package-archives"
         case $failure in
           fail-download)
             printf 'Simulated Docker download failure\n' >&2
@@ -251,22 +168,6 @@ run_docker_install() {
               return 100
             fi
             ;;
-          clean-global-cache)
-            if [[ " $* " == *' --download-only '* ]]; then
-              mkdir -p -- "$archives"
-              printf 'downloaded Docker package\n' >"$archives/docker.deb"
-            elif [[ " $* " == *' --no-download '* ]]; then
-              printf 'Simulated global package cache cleanup\n' >&2
-              rm -rf -- "$apt_dir/global-archives"
-              [[ -f $archives/docker.deb ]] || return 100
-            else
-              return 1
-            fi
-            ;;
-          relative-tmpdir|absolute-tmpdir)
-            [[ $archives == "$expected_tmpdir/"* && -d $archives ]] || return 100
-            printf 'Configured Docker archive directory\n' >&2
-            ;;
         esac
       fi
     }
@@ -278,9 +179,8 @@ run_docker_install() {
 }
 
 check_docker_package_steps() {
-  local -a package_steps=() package_archives=()
+  local -a package_steps=()
   mapfile -t package_steps <"$1/package-steps"
-  mapfile -t package_archives <"$1/package-archives"
   [[ ${#package_steps[@]} == 2 && " ${package_steps[0]} " == *' --download-only '* && " ${package_steps[1]} " == *' --no-download '* ]] || die 'Docker packages were not downloaded before application'
-  [[ ${#package_archives[@]} == 2 && ${package_archives[0]} == /* && ${package_archives[0]} == "${package_archives[1]}" ]] || die 'Docker package phases used different or relative archive directories'
+  [[ ${package_steps[*]} != *Dir::Cache::* ]] || die 'Docker package phases overrode the APT cache'
 }
